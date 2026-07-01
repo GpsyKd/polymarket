@@ -1,9 +1,12 @@
 """Paper-trading engine.
 
-Two ways a position leaves the book:
+Positions leave the book two ways:
   * resolve()        — the market settled; pay 1/0 on the winning outcome.
   * mark_and_exit()  — short-horizon (flow) exit at the current mid on
                         take-profit / stop-loss / max-hold.
+
+Positions are opened by tick() (a per-market Strategy) or llm_tick() (the
+batch news+LLM funnel); both share _open_position() for sizing + risk caps.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import logging
 from datetime import datetime, timezone
 
 from ..config import Settings
-from ..data.clob import ClobClient
+from ..data.clob import ClobClient, OrderBook
 from ..data.gamma import GammaClient
 from ..data.models import Market
 from ..screener.stage0 import screen_markets
@@ -86,14 +89,92 @@ def exit_decision(
 
 
 class PaperEngine:
-    def __init__(self, settings: Settings, storage: Storage, strategy: Strategy) -> None:
+    def __init__(self, settings: Settings, storage: Storage, strategy: Strategy | None = None) -> None:
         self.s = settings
         self.store = storage
         self.strategy = strategy
 
+    def _load_state(self) -> tuple[set[str], float, dict[str, float]]:
+        open_ids = self.store.open_market_ids()
+        remaining = self.s.max_total_exposure_usd - self.store.open_exposure()
+        group_exposure = self.store.exposure_by_group()
+        return open_ids, remaining, group_exposure
+
+    def _group_full(self, market: Market, group_exposure: dict[str, float]) -> bool:
+        left = self.s.max_exposure_per_group_usd - group_exposure.get(market.group_key(), 0.0)
+        return left < self.s.min_stake_usd
+
+    def _open_position(
+        self,
+        market: Market,
+        yes_price: float,
+        book: OrderBook | None,
+        prob_yes: float,
+        edge_floor: float,
+        remaining: float,
+        group_exposure: dict[str, float],
+        dry_run: bool,
+        *,
+        strategy_name: str,
+        rationale: str,
+    ) -> tuple[Position | None, float]:
+        s = self.s
+        gkey = market.group_key()
+        remaining_group = s.max_exposure_per_group_usd - group_exposure.get(gkey, 0.0)
+        if remaining_group < s.min_stake_usd:
+            return None, 0.0
+
+        half_spread = (book.spread / 2.0) if (book and book.spread is not None) else 0.0
+        bet = decide_bet(
+            prob_yes,
+            yes_price,
+            bankroll=s.bankroll_usd,
+            min_edge=edge_floor,
+            kelly_mult=s.kelly_fraction,
+            max_position=s.max_position_usd,
+            min_stake=s.min_stake_usd,
+            remaining_exposure=min(remaining, remaining_group),
+            fee=half_spread,
+        )
+        if bet is None:
+            return None, 0.0
+
+        pos = Position(
+            market_id=market.id,
+            token_id=market.clob_token_ids[0] if market.clob_token_ids else None,
+            question=market.question,
+            side=bet.side,
+            entry_price=bet.price,
+            model_prob=bet.prob,
+            edge=bet.edge,
+            size_usd=bet.size_usd,
+            shares=bet.shares,
+            ts_open=_now_iso(),
+            strategy=strategy_name,
+            rationale=rationale,
+            group_key=gkey,
+            mode="paper",
+        )
+        if not dry_run:
+            pos.id = self.store.insert_position(pos)
+        group_exposure[gkey] = group_exposure.get(gkey, 0.0) + bet.size_usd
+        return pos, bet.size_usd
+
+    async def _fetch_book(self, clob: ClobClient, market: Market) -> OrderBook | None:
+        token = market.clob_token_ids[0] if market.clob_token_ids else None
+        if not token:
+            return None
+        try:
+            return await clob.fetch_book(token)
+        except Exception as e:  # noqa: BLE001
+            log.debug("book fetch failed for %s: %s", token, e)
+            return None
+
     async def tick(
         self, top_candidates: int = 30, min_edge: float | None = None, dry_run: bool = False
     ) -> list[Position]:
+        if self.strategy is None:
+            raise ValueError("tick() requires a strategy")
         s = self.s
         edge_floor = s.min_edge if min_edge is None else min_edge
 
@@ -102,9 +183,7 @@ class PaperEngine:
         screened = screen_markets(markets, s)
         log.info("screened %d / %d markets", len(screened), len(markets))
 
-        open_ids = self.store.open_market_ids()
-        remaining = s.max_total_exposure_usd - self.store.open_exposure()
-        group_exposure = self.store.exposure_by_group()
+        open_ids, remaining, group_exposure = self._load_state()
         opened: list[Position] = []
 
         async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
@@ -112,22 +191,10 @@ class PaperEngine:
                 if len(opened) >= s.max_new_positions_per_tick or remaining < s.min_stake_usd:
                     break
                 m = r.market
-                if m.id in open_ids:
+                if m.id in open_ids or self._group_full(m, group_exposure):
                     continue
 
-                gkey = m.group_key()
-                remaining_group = s.max_exposure_per_group_usd - group_exposure.get(gkey, 0.0)
-                if remaining_group < s.min_stake_usd:
-                    continue
-
-                token = m.clob_token_ids[0] if m.clob_token_ids else None
-                book = None
-                if token:
-                    try:
-                        book = await clob.fetch_book(token)
-                    except Exception as e:  # noqa: BLE001
-                        log.debug("book fetch failed for %s: %s", token, e)
-
+                book = await self._fetch_book(clob, m)
                 yes_price = book.mid if (book and book.mid is not None) else m.yes_price()
                 if yes_price is None or not (0.0 < yes_price < 1.0):
                     continue
@@ -138,42 +205,62 @@ class PaperEngine:
                 if signal is None:
                     continue
 
-                half_spread = (book.spread / 2.0) if (book and book.spread is not None) else 0.0
-                bet = decide_bet(
-                    signal.prob_yes,
-                    yes_price,
-                    bankroll=s.bankroll_usd,
-                    min_edge=edge_floor,
-                    kelly_mult=s.kelly_fraction,
-                    max_position=s.max_position_usd,
-                    min_stake=s.min_stake_usd,
-                    remaining_exposure=min(remaining, remaining_group),
-                    fee=half_spread,
+                pos, used = self._open_position(
+                    m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
+                    dry_run, strategy_name=self.strategy.name, rationale=signal.rationale,
                 )
-                if bet is None:
+                if pos is None:
+                    continue
+                opened.append(pos)
+                remaining -= used
+                open_ids.add(m.id)
+
+        return opened
+
+    async def llm_tick(
+        self, analyzer, top_candidates: int = 30, min_edge: float | None = None, dry_run: bool = False
+    ) -> list[Position]:
+        s = self.s
+        edge_floor = s.min_edge if min_edge is None else min_edge
+
+        async with GammaClient(s.gamma_base_url, s.http_timeout) as gamma:
+            markets = await gamma.fetch_markets(max_markets=2000)
+        screened = screen_markets(markets, s)
+        candidates = [r.market for r in screened[: max(top_candidates, s.llm_triage_batch)]][: s.llm_triage_batch]
+
+        selected = await analyzer.triage(candidates, s.llm_max_deep)
+        log.info("llm triage: %d candidates -> %d selected", len(candidates), len(selected))
+
+        open_ids, remaining, group_exposure = self._load_state()
+        opened: list[Position] = []
+
+        async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
+            for m in selected:
+                if len(opened) >= s.max_new_positions_per_tick or remaining < s.min_stake_usd:
+                    break
+                if m.id in open_ids or self._group_full(m, group_exposure):
                     continue
 
-                pos = Position(
-                    market_id=m.id,
-                    token_id=token,
-                    question=m.question,
-                    side=bet.side,
-                    entry_price=bet.price,
-                    model_prob=bet.prob,
-                    edge=bet.edge,
-                    size_usd=bet.size_usd,
-                    shares=bet.shares,
-                    ts_open=_now_iso(),
-                    strategy=self.strategy.name,
-                    rationale=signal.rationale,
-                    group_key=gkey,
-                    mode="paper",
+                book = await self._fetch_book(clob, m)
+                yes_price = book.mid if (book and book.mid is not None) else m.yes_price()
+                if yes_price is None or not (0.0 < yes_price < 1.0):
+                    continue
+                if book and book.spread is not None and book.spread > s.screen_max_spread:
+                    continue
+
+                signal = await analyzer.deep_analyze(m, yes_price)
+                if signal is None:
+                    continue
+
+                pos, used = self._open_position(
+                    m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
+                    dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
                 )
-                if not dry_run:
-                    pos.id = self.store.insert_position(pos)
+                if pos is None:
+                    continue
                 opened.append(pos)
-                remaining -= bet.size_usd
-                group_exposure[gkey] = group_exposure.get(gkey, 0.0) + bet.size_usd
+                remaining -= used
+                open_ids.add(m.id)
 
         return opened
 

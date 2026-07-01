@@ -57,11 +57,17 @@ Python 3.11+. Текущие зависимости: `httpx`, `pydantic`, `pydan
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env   # опционально, для правки порогов
 
-.venv/bin/polybot screen --top 20     # Stage-0 скрин рынков
-.venv/bin/polybot run --once          # один цикл: resolve → mark → tick
-.venv/bin/polybot run --interval 300  # непрерывный paper-цикл (Ctrl-C — стоп)
-.venv/bin/polybot report              # метрики: ROI, Brier, калибровка, позиции
-# отдельные шаги также доступны: paper-tick / mark / resolve
+.venv/bin/polybot screen --top 20               # Stage-0 скрин рынков
+.venv/bin/polybot run --strategy micro --once   # один цикл микроструктуры
+.venv/bin/polybot run --strategy llm --once     # один цикл news+LLM воронки
+.venv/bin/polybot run --interval 300            # непрерывный paper-цикл (Ctrl-C — стоп)
+.venv/bin/polybot report                        # метрики: ROI, Brier, калибровка, позиции
+# отдельные шаги: paper-tick / llm-tick / mark / resolve
 ```
 
-> ⚠️ Стратегия в Phase 1 — **заглушка** (`PlaceholderStrategy`, наивный mean-reversion) для обкатки пайплайна. Её PnL не отражает реальный edge; реальные сигналы — в Phase 2.
+**Сигналы:**
+- `micro` — микроструктура ордербука (imbalance), flow-горизонт с выходом по TP/SL/времени.
+- `llm` — воронка news+LLM: дешёвый triage → глубокий разбор (Grok + Live Search), держится до резолва. Требует ключ (`POLYBOT_GROK_API_KEY` или `XAI_API_KEY`/`GROK_API_KEY`) и актуальные id моделей xAI в `.env` (`POLYBOT_LLM_TRIAGE_MODEL` / `POLYBOT_LLM_DEEP_MODEL`).
+- `placeholder` — заглушка для обкатки пайплайна (PnL не отражает edge).
+
+Реальный edge каждого сигнала проверяется на paper-статистике (`report`: ROI, Brier vs рынок).

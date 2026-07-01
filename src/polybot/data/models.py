@@ -50,6 +50,7 @@ class Market(BaseModel):
 
     id: str
     question: str
+    description: str | None = None
     slug: str | None = None
     condition_id: str | None = Field(default=None, alias="conditionId")
 

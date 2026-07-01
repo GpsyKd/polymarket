@@ -59,9 +59,17 @@ class Settings(BaseSettings):
     exit_stop_loss: float = 0.05  # close when side price drops this much
     exit_max_hold_hours: float = 48.0
 
-    # --- LLM keys (unused in the Phase 1 data slice) ---
+    # --- LLM (news-signal funnel; OpenAI-compatible endpoint, default xAI/Grok) ---
     grok_api_key: str | None = None
     anthropic_api_key: str | None = None
+    llm_base_url: str = "https://api.x.ai/v1"
+    llm_api_key: str | None = None  # falls back to grok_api_key / env XAI_API_KEY|GROK_API_KEY
+    llm_triage_model: str = "grok-2-latest"  # set to your current xAI model id
+    llm_deep_model: str = "grok-2-latest"    # set to your current xAI model id
+    llm_live_search: bool = True  # xAI Live Search (X/web) on deep analysis
+    llm_triage_batch: int = 30
+    llm_max_deep: int = 6
+    llm_min_confidence: float = 0.55
 
     log_level: str = "INFO"
 

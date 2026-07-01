@@ -162,3 +162,28 @@ def test_exposure_by_group(tmp_path):
     exposure = store.exposure_by_group()
     assert exposure == {"neg:A": 6.0, "neg:B": 3.0}
     store.close()
+
+
+def test_open_position_group_cap(tmp_path):
+    from polybot.config import Settings
+    from polybot.paper.engine import PaperEngine
+
+    store = Storage(str(tmp_path / "e.sqlite3"))
+    settings = Settings(
+        max_exposure_per_group_usd=3.0, min_stake_usd=1.0, max_position_usd=15.0,
+        bankroll_usd=100.0, kelly_fraction=0.25, max_total_exposure_usd=80.0,
+    )
+    engine = PaperEngine(settings, store)
+    m = _market(negRiskMarketID="0xG")
+
+    ge: dict[str, float] = {}
+    pos, used = engine._open_position(m, 0.5, None, 0.7, 0.05, 100.0, ge,
+                                      dry_run=False, strategy_name="t", rationale="r")
+    assert pos is not None and used > 0 and ge["neg:0xG"] == used
+    assert used <= 3.0 + 1e-9  # clamped to the group budget
+
+    # group already full → no position
+    pos2, used2 = engine._open_position(m, 0.5, None, 0.7, 0.05, 100.0, {"neg:0xG": 3.0},
+                                        dry_run=True, strategy_name="t", rationale="r")
+    assert pos2 is None and used2 == 0.0
+    store.close()

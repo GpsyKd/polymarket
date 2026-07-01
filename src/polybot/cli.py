@@ -9,6 +9,8 @@ import logging
 
 from .config import get_settings
 from .data.gamma import GammaClient
+from .llm.client import LLMClient, resolve_api_key
+from .llm.news_signal import NewsLLMAnalyzer
 from .logsetup import setup_logging
 from .paper.engine import PaperEngine
 from .paper.metrics import build_report
@@ -51,7 +53,7 @@ def _print_table(results: list[ScreenResult]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# strategy factory
+# strategy / analyzer factories
 # --------------------------------------------------------------------------- #
 def _build_strategy(name: str, pull: float | None):
     settings = get_settings()
@@ -66,8 +68,24 @@ def _build_strategy(name: str, pull: float | None):
     return strat, settings.min_edge
 
 
+def _make_llm_client() -> LLMClient | None:
+    settings = get_settings()
+    key = resolve_api_key(settings)
+    if not key:
+        log.error("No LLM API key. Set POLYBOT_GROK_API_KEY (or XAI_API_KEY / GROK_API_KEY).")
+        return None
+    return LLMClient(settings.llm_base_url, key, timeout=settings.http_timeout * 4)
+
+
+def _make_analyzer(client: LLMClient) -> NewsLLMAnalyzer:
+    s = get_settings()
+    return NewsLLMAnalyzer(
+        client, s.llm_triage_model, s.llm_deep_model, s.llm_live_search, s.llm_min_confidence
+    )
+
+
 # --------------------------------------------------------------------------- #
-# paper-tick / mark / resolve / report
+# open / mark / resolve / report
 # --------------------------------------------------------------------------- #
 async def _run_tick(strategy: str, top: int, pull: float | None, min_edge: float | None, dry_run: bool) -> None:
     settings = get_settings()
@@ -78,16 +96,37 @@ async def _run_tick(strategy: str, top: int, pull: float | None, min_edge: float
     opened = await engine.tick(top_candidates=top, min_edge=edge, dry_run=dry_run)
     log.info("Opened %d paper position(s) via %s%s",
              len(opened), strat.name, " [dry-run]" if dry_run else "")
-    for p in opened:
-        print(f"  {p.side:<3} entry {p.entry_price:.3f}  ${p.size_usd:5.2f}  "
-              f"edge {p.edge:+.3f}  {p.question[:48]}")
+    _print_opened(opened)
     store.close()
+
+
+async def _run_llm_tick(top: int, min_edge: float | None, dry_run: bool) -> None:
+    settings = get_settings()
+    client = _make_llm_client()
+    if client is None:
+        return
+    store = Storage(settings.db_path)
+    edge = settings.min_edge if min_edge is None else min_edge
+    async with client:
+        analyzer = _make_analyzer(client)
+        engine = PaperEngine(settings, store, strategy=None)
+        opened = await engine.llm_tick(analyzer, top_candidates=top, min_edge=edge, dry_run=dry_run)
+    log.info("llm-tick opened %d position(s)%s", len(opened), " [dry-run]" if dry_run else "")
+    _print_opened(opened, show_rationale=True)
+    store.close()
+
+
+def _print_opened(opened, show_rationale: bool = False) -> None:
+    for p in opened:
+        extra = f"  {p.rationale[:44]}" if show_rationale else ""
+        print(f"  {p.side:<3} entry {p.entry_price:.3f}  ${p.size_usd:5.2f}  "
+              f"edge {p.edge:+.3f}  {p.question[:44]}{extra}")
 
 
 async def _run_mark() -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
-    engine = PaperEngine(settings, store, PlaceholderStrategy())
+    engine = PaperEngine(settings, store)
     closed = await engine.mark_and_exit()
     log.info("Marked-to-market: closed %d position(s)", len(closed))
     for p, pnl, reason in closed:
@@ -98,7 +137,7 @@ async def _run_mark() -> None:
 async def _run_resolve() -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
-    engine = PaperEngine(settings, store, PlaceholderStrategy())
+    engine = PaperEngine(settings, store)
     closed = await engine.resolve()
     log.info("Resolved/closed %d position(s)", len(closed))
     for p, pnl in closed:
@@ -139,19 +178,39 @@ def _run_report() -> None:
 async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, min_edge: float | None) -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
-    strat, default_edge = _build_strategy(strategy, None)
-    edge = default_edge if min_edge is None else min_edge
     interval = settings.runner_interval_seconds if interval is None else interval
-    engine = PaperEngine(settings, store, strat)
+    client: LLMClient | None = None
+
+    if strategy == "llm":
+        client = _make_llm_client()
+        if client is None:
+            store.close()
+            return
+        analyzer = _make_analyzer(client)
+        engine = PaperEngine(settings, store, strategy=None)
+        edge = settings.min_edge if min_edge is None else min_edge
+        strat_name = analyzer.name
+
+        async def do_tick():
+            return await engine.llm_tick(analyzer, top_candidates=top, min_edge=edge)
+    else:
+        strat, default_edge = _build_strategy(strategy, None)
+        engine = PaperEngine(settings, store, strat)
+        edge = default_edge if min_edge is None else min_edge
+        strat_name = strat.name
+
+        async def do_tick():
+            return await engine.tick(top_candidates=top, min_edge=edge)
+
     log.info("runner start: strategy=%s edge=%.3f interval=%ss%s",
-             strat.name, edge, interval, " [once]" if once else "")
+             strat_name, edge, interval, " [once]" if once else "")
     cycle = 0
     try:
         while True:
             cycle += 1
             resolved = await engine.resolve()
             exited = await engine.mark_and_exit()
-            opened = await engine.tick(top_candidates=top, min_edge=edge)
+            opened = await do_tick()
             log.info(
                 "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f",
                 cycle, len(resolved), len(exited), len(opened),
@@ -163,6 +222,8 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
     except asyncio.CancelledError:
         pass
     finally:
+        if client is not None:
+            await client.aclose()
         store.close()
         log.info("runner stopped after %d cycle(s)", cycle)
 
@@ -180,13 +241,18 @@ def main() -> None:
 
     tick = sub.add_parser("paper-tick", help="Screen, decide, and open paper positions")
     tick.add_argument("--strategy", choices=["micro", "placeholder"], default="micro")
-    tick.add_argument("--top", type=int, default=30, help="candidates to consider")
+    tick.add_argument("--top", type=int, default=30)
     tick.add_argument("--pull", type=float, default=None, help="placeholder strategy strength")
-    tick.add_argument("--min-edge", type=float, default=None, help="override min edge")
-    tick.add_argument("--dry-run", action="store_true", help="don't persist")
+    tick.add_argument("--min-edge", type=float, default=None)
+    tick.add_argument("--dry-run", action="store_true")
+
+    llm = sub.add_parser("llm-tick", help="News+LLM funnel: triage → deep-analyze → open")
+    llm.add_argument("--top", type=int, default=30, help="candidates fed to triage")
+    llm.add_argument("--min-edge", type=float, default=None)
+    llm.add_argument("--dry-run", action="store_true")
 
     run = sub.add_parser("run", help="Run the paper loop: resolve → mark → tick on an interval")
-    run.add_argument("--strategy", choices=["micro", "placeholder"], default="micro")
+    run.add_argument("--strategy", choices=["micro", "placeholder", "llm"], default="micro")
     run.add_argument("--top", type=int, default=30)
     run.add_argument("--interval", type=int, default=None, help="seconds between cycles")
     run.add_argument("--once", action="store_true", help="run a single cycle and exit")
@@ -205,6 +271,8 @@ def main() -> None:
         asyncio.run(_run_screen(getattr(args, "top", 25), getattr(args, "max_markets", 2000)))
     elif cmd == "paper-tick":
         asyncio.run(_run_tick(args.strategy, args.top, args.pull, args.min_edge, args.dry_run))
+    elif cmd == "llm-tick":
+        asyncio.run(_run_llm_tick(args.top, args.min_edge, args.dry_run))
     elif cmd == "run":
         try:
             asyncio.run(_run_loop(args.strategy, args.top, args.interval, args.once, args.min_edge))
