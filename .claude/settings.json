@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(git ls-remote *)",
+      "Bash(gh auth *)",
+      "Bash(git --version)",
+      "Bash(git -C \"/Users/kirill/Documents/Project B/13 polymarket\" init)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'chore: initialize repository with project scaffold *)",
+      "Bash(git branch *)",
+      "Bash(git remote *)"
+    ]
+  }
+}

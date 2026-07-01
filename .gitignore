@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets & environment
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+
+# Data, models, logs
+data/
+*.sqlite
+*.sqlite3
+*.db
+logs/
+*.log
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
