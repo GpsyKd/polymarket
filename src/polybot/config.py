@@ -64,8 +64,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     llm_base_url: str = "https://api.x.ai/v1"
     llm_api_key: str | None = None  # falls back to grok_api_key / env XAI_API_KEY|GROK_API_KEY
-    llm_triage_model: str = "grok-2-latest"  # set to your current xAI model id
-    llm_deep_model: str = "grok-2-latest"    # set to your current xAI model id
+    llm_triage_model: str = "grok-4.3"  # xAI current default (Apr 2026): 1M ctx, ~$1.25/$2.50 per 1M
+    llm_deep_model: str = "grok-4.3"
     llm_live_search: bool = True  # xAI Live Search (X/web) on deep analysis
     llm_triage_batch: int = 30
     llm_max_deep: int = 6
