@@ -19,12 +19,12 @@ env/
 *.key
 secrets/
 
-# Data, models, logs
-data/
+# Data, models, logs (runtime dirs at repo root only)
+/data/
 *.sqlite
 *.sqlite3
 *.db
-logs/
+/logs/
 *.log
 
 # OS / IDE
