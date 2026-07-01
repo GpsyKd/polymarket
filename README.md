@@ -49,4 +49,18 @@
 
 ## Стек
 
-Python. Ключевые зависимости (планово): `py-clob-client`, `aiogram`, `httpx`/`websockets`, `pydantic`, `SQLModel`/`SQLAlchemy`. Деплой — Docker на VPS.
+Python 3.11+. Текущие зависимости: `httpx`, `pydantic`, `pydantic-settings`, stdlib `sqlite3`. Планово: `aiogram` (Telegram), `py-clob-client` (live-исполнение), `websockets`. Деплой — Docker на VPS.
+
+## Использование (CLI)
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+cp .env.example .env   # опционально, для правки порогов
+
+.venv/bin/polybot screen --top 20      # Stage-0 скрин рынков
+.venv/bin/polybot paper-tick --top 20  # открыть paper-позиции
+.venv/bin/polybot report               # метрики: ROI, Brier, калибровка, открытые позиции
+.venv/bin/polybot resolve              # закрыть позиции по резолвнутым рынкам
+```
+
+> ⚠️ Стратегия в Phase 1 — **заглушка** (`PlaceholderStrategy`, наивный mean-reversion) для обкатки пайплайна. Её PnL не отражает реальный edge; реальные сигналы — в Phase 2.

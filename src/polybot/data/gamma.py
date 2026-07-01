@@ -96,3 +96,20 @@ class GammaClient:
                 break
             offset += page_size
         return markets[:max_markets]
+
+    async def get_market(self, market_id: str) -> Market | None:
+        """Fetch a single market by id (used to detect resolution)."""
+        try:
+            r = await self._client.get(f"/markets/{market_id}")
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            return None
+        data = r.json()
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not data:
+            return None
+        try:
+            return Market.model_validate(data)
+        except Exception:  # noqa: BLE001
+            return None

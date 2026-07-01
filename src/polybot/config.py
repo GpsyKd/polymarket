@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     max_total_exposure_usd: float = 80.0
     daily_loss_limit_usd: float = 20.0
     min_edge: float = 0.05  # min edge (probability points) to place a bet
+    kelly_fraction: float = 0.25  # fractional-Kelly multiplier
+    min_stake_usd: float = 1.0
+    max_new_positions_per_tick: int = 5
 
     # --- Stage-0 screener thresholds ---
     screen_min_liquidity_usd: float = 1000.0
@@ -38,6 +41,10 @@ class Settings(BaseSettings):
     screen_max_spread: float = 0.08
     screen_price_low: float = 0.05
     screen_price_high: float = 0.95
+
+    # --- Storage & paper engine ---
+    db_path: str = "data/polybot.sqlite3"
+    placeholder_pull: float = 0.06  # Phase-1 placeholder strategy strength
 
     # --- LLM keys (unused in the Phase 1 data slice) ---
     grok_api_key: str | None = None
