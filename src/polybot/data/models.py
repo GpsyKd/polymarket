@@ -71,6 +71,10 @@ class Market(BaseModel):
     best_bid: float | None = Field(default=None, alias="bestBid")
     best_ask: float | None = Field(default=None, alias="bestAsk")
 
+    neg_risk_market_id: str | None = Field(default=None, alias="negRiskMarketID")
+    group_item_title: str | None = Field(default=None, alias="groupItemTitle")
+    events: list[dict[str, Any]] = Field(default_factory=list)
+
     @field_validator(
         "liquidity", "volume", "volume_24hr", "spread", "best_bid", "best_ask",
         mode="before",
@@ -101,3 +105,13 @@ class Market(BaseModel):
     def yes_price(self) -> float | None:
         """Price of the first outcome (Polymarket lists 'Yes' first for binary markets)."""
         return self.outcome_prices[0] if self.outcome_prices else None
+
+    def group_key(self) -> str:
+        """Correlation key: neg-risk group (mutually-exclusive outcomes) > event > self."""
+        if self.neg_risk_market_id:
+            return f"neg:{self.neg_risk_market_id}"
+        if self.events:
+            ident = self.events[0].get("id") or self.events[0].get("slug")
+            if ident:
+                return f"evt:{ident}"
+        return f"mkt:{self.id}"

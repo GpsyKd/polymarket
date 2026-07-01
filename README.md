@@ -57,10 +57,11 @@ Python 3.11+. Текущие зависимости: `httpx`, `pydantic`, `pydan
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env   # опционально, для правки порогов
 
-.venv/bin/polybot screen --top 20      # Stage-0 скрин рынков
-.venv/bin/polybot paper-tick --top 20  # открыть paper-позиции
-.venv/bin/polybot report               # метрики: ROI, Brier, калибровка, открытые позиции
-.venv/bin/polybot resolve              # закрыть позиции по резолвнутым рынкам
+.venv/bin/polybot screen --top 20     # Stage-0 скрин рынков
+.venv/bin/polybot run --once          # один цикл: resolve → mark → tick
+.venv/bin/polybot run --interval 300  # непрерывный paper-цикл (Ctrl-C — стоп)
+.venv/bin/polybot report              # метрики: ROI, Brier, калибровка, позиции
+# отдельные шаги также доступны: paper-tick / mark / resolve
 ```
 
 > ⚠️ Стратегия в Phase 1 — **заглушка** (`PlaceholderStrategy`, наивный mean-reversion) для обкатки пайплайна. Её PnL не отражает реальный edge; реальные сигналы — в Phase 2.

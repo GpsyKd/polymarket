@@ -51,7 +51,7 @@ def _print_table(results: list[ScreenResult]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# paper-tick / mark / resolve / report
+# strategy factory
 # --------------------------------------------------------------------------- #
 def _build_strategy(name: str, pull: float | None):
     settings = get_settings()
@@ -66,6 +66,9 @@ def _build_strategy(name: str, pull: float | None):
     return strat, settings.min_edge
 
 
+# --------------------------------------------------------------------------- #
+# paper-tick / mark / resolve / report
+# --------------------------------------------------------------------------- #
 async def _run_tick(strategy: str, top: int, pull: float | None, min_edge: float | None, dry_run: bool) -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
@@ -131,6 +134,40 @@ def _run_report() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# run loop
+# --------------------------------------------------------------------------- #
+async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, min_edge: float | None) -> None:
+    settings = get_settings()
+    store = Storage(settings.db_path)
+    strat, default_edge = _build_strategy(strategy, None)
+    edge = default_edge if min_edge is None else min_edge
+    interval = settings.runner_interval_seconds if interval is None else interval
+    engine = PaperEngine(settings, store, strat)
+    log.info("runner start: strategy=%s edge=%.3f interval=%ss%s",
+             strat.name, edge, interval, " [once]" if once else "")
+    cycle = 0
+    try:
+        while True:
+            cycle += 1
+            resolved = await engine.resolve()
+            exited = await engine.mark_and_exit()
+            opened = await engine.tick(top_candidates=top, min_edge=edge)
+            log.info(
+                "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f",
+                cycle, len(resolved), len(exited), len(opened),
+                len(store.open_positions()), store.open_exposure(),
+            )
+            if once:
+                break
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        store.close()
+        log.info("runner stopped after %d cycle(s)", cycle)
+
+
+# --------------------------------------------------------------------------- #
 # entrypoint
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -148,6 +185,13 @@ def main() -> None:
     tick.add_argument("--min-edge", type=float, default=None, help="override min edge")
     tick.add_argument("--dry-run", action="store_true", help="don't persist")
 
+    run = sub.add_parser("run", help="Run the paper loop: resolve → mark → tick on an interval")
+    run.add_argument("--strategy", choices=["micro", "placeholder"], default="micro")
+    run.add_argument("--top", type=int, default=30)
+    run.add_argument("--interval", type=int, default=None, help="seconds between cycles")
+    run.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    run.add_argument("--min-edge", type=float, default=None)
+
     sub.add_parser("mark", help="Mark open positions to market; exit on TP/SL/max-hold")
     sub.add_parser("resolve", help="Close positions whose markets have resolved")
     sub.add_parser("report", help="Show ledger metrics (ROI, Brier, calibration)")
@@ -161,6 +205,11 @@ def main() -> None:
         asyncio.run(_run_screen(getattr(args, "top", 25), getattr(args, "max_markets", 2000)))
     elif cmd == "paper-tick":
         asyncio.run(_run_tick(args.strategy, args.top, args.pull, args.min_edge, args.dry_run))
+    elif cmd == "run":
+        try:
+            asyncio.run(_run_loop(args.strategy, args.top, args.interval, args.once, args.min_edge))
+        except KeyboardInterrupt:
+            log.info("interrupted")
     elif cmd == "mark":
         asyncio.run(_run_mark())
     elif cmd == "resolve":

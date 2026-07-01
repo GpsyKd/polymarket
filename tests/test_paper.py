@@ -140,3 +140,25 @@ def test_storage_and_report(tmp_path):
     assert abs(res["brier_baseline_market"] - 0.25) < 1e-9  # (0.5-1)^2
     assert res["beats_market"] is True
     store.close()
+
+
+def test_market_group_key():
+    neg = _market(negRiskMarketID="0xabc")
+    assert neg.group_key() == "neg:0xabc"
+    evt = Market.model_validate(
+        {"id": "2", "question": "Q", "outcomes": ["Yes", "No"], "events": [{"id": "30615", "slug": "wc"}]}
+    )
+    assert evt.group_key() == "evt:30615"
+    assert _market(id="3").group_key() == "mkt:3"
+
+
+def test_exposure_by_group(tmp_path):
+    store = Storage(str(tmp_path / "g.sqlite3"))
+    for mid, gk in [("1", "neg:A"), ("2", "neg:A"), ("3", "neg:B")]:
+        store.insert_position(Position(
+            market_id=mid, question="Q", side="YES", entry_price=0.5, model_prob=0.6,
+            edge=0.1, size_usd=3.0, shares=6.0, ts_open=_now(), group_key=gk,
+        ))
+    exposure = store.exposure_by_group()
+    assert exposure == {"neg:A": 6.0, "neg:B": 3.0}
+    store.close()

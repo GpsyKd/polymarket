@@ -104,6 +104,7 @@ class PaperEngine:
 
         open_ids = self.store.open_market_ids()
         remaining = s.max_total_exposure_usd - self.store.open_exposure()
+        group_exposure = self.store.exposure_by_group()
         opened: list[Position] = []
 
         async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
@@ -112,6 +113,11 @@ class PaperEngine:
                     break
                 m = r.market
                 if m.id in open_ids:
+                    continue
+
+                gkey = m.group_key()
+                remaining_group = s.max_exposure_per_group_usd - group_exposure.get(gkey, 0.0)
+                if remaining_group < s.min_stake_usd:
                     continue
 
                 token = m.clob_token_ids[0] if m.clob_token_ids else None
@@ -141,7 +147,7 @@ class PaperEngine:
                     kelly_mult=s.kelly_fraction,
                     max_position=s.max_position_usd,
                     min_stake=s.min_stake_usd,
-                    remaining_exposure=remaining,
+                    remaining_exposure=min(remaining, remaining_group),
                     fee=half_spread,
                 )
                 if bet is None:
@@ -160,12 +166,14 @@ class PaperEngine:
                     ts_open=_now_iso(),
                     strategy=self.strategy.name,
                     rationale=signal.rationale,
+                    group_key=gkey,
                     mode="paper",
                 )
                 if not dry_run:
                     pos.id = self.store.insert_position(pos)
                 opened.append(pos)
                 remaining -= bet.size_usd
+                group_exposure[gkey] = group_exposure.get(gkey, 0.0) + bet.size_usd
 
         return opened
 

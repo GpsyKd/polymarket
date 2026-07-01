@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS positions (
     status TEXT NOT NULL DEFAULT 'open',
     strategy TEXT,
     rationale TEXT,
+    group_key TEXT,
     ts_close TEXT,
     exit_price REAL,
     pnl_usd REAL,
@@ -36,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 _COLS = [
     "ts_open", "market_id", "token_id", "question", "side", "entry_price",
     "model_prob", "edge", "size_usd", "shares", "status", "strategy",
-    "rationale", "mode",
+    "rationale", "group_key", "mode",
 ]
 
 
@@ -55,6 +56,7 @@ class Position:
     status: str = "open"
     strategy: str = ""
     rationale: str = ""
+    group_key: str | None = None
     ts_close: str | None = None
     exit_price: float | None = None
     pnl_usd: float | None = None
@@ -78,7 +80,7 @@ class Storage:
     def _migrate(self) -> None:
         """Add columns introduced after a DB was first created."""
         existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
-        for col, ddl in (("close_reason", "close_reason TEXT"),):
+        for col, ddl in (("close_reason", "close_reason TEXT"), ("group_key", "group_key TEXT")):
             if col not in existing:
                 self.conn.execute(f"ALTER TABLE positions ADD COLUMN {ddl}")
 
@@ -115,6 +117,13 @@ class Storage:
             "SELECT COALESCE(SUM(size_usd), 0) AS s FROM positions WHERE status='open'"
         ).fetchone()
         return float(row["s"] or 0.0)
+
+    def exposure_by_group(self) -> dict[str, float]:
+        rows = self.conn.execute(
+            "SELECT group_key, COALESCE(SUM(size_usd), 0) AS s FROM positions "
+            "WHERE status='open' AND group_key IS NOT NULL GROUP BY group_key"
+        ).fetchall()
+        return {r["group_key"]: float(r["s"] or 0.0) for r in rows}
 
     def close_position(
         self,

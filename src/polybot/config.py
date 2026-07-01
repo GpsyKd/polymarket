@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     kelly_fraction: float = 0.25  # fractional-Kelly multiplier
     min_stake_usd: float = 1.0
     max_new_positions_per_tick: int = 5
+    max_exposure_per_group_usd: float = 20.0  # cap correlated (same-event) exposure
 
     # --- Stage-0 screener thresholds ---
     screen_min_liquidity_usd: float = 1000.0
@@ -45,6 +46,7 @@ class Settings(BaseSettings):
     # --- Storage & paper engine ---
     db_path: str = "data/polybot.sqlite3"
     placeholder_pull: float = 0.06  # Phase-1 placeholder strategy strength
+    runner_interval_seconds: int = 300
 
     # --- Microstructure strategy ---
     micro_min_imbalance: float = 0.35  # ignore weaker order-book imbalance
