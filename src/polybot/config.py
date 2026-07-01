@@ -46,6 +46,17 @@ class Settings(BaseSettings):
     db_path: str = "data/polybot.sqlite3"
     placeholder_pull: float = 0.06  # Phase-1 placeholder strategy strength
 
+    # --- Microstructure strategy ---
+    micro_min_imbalance: float = 0.35  # ignore weaker order-book imbalance
+    micro_depth_levels: int = 5
+    micro_edge_scale: float = 0.06  # prob lean per unit signed imbalance
+    micro_min_edge: float = 0.02  # flow trades use a lower edge floor than value bets
+
+    # --- Exits (mark-to-market) for short-horizon strategies ---
+    exit_take_profit: float = 0.03  # close when side price gains this much
+    exit_stop_loss: float = 0.05  # close when side price drops this much
+    exit_max_hold_hours: float = 48.0
+
     # --- LLM keys (unused in the Phase 1 data slice) ---
     grok_api_key: str | None = None
     anthropic_api_key: str | None = None

@@ -36,15 +36,24 @@ def decide_bet(
     max_position: float,
     min_stake: float,
     remaining_exposure: float,
+    fee: float = 0.0,
 ) -> Bet | None:
-    """Pick the better side (YES/NO) and size it, or return None to skip."""
+    """Pick the better side (YES/NO) and size it, or return None to skip.
+
+    `fee` is added to the entry price to model crossing the spread (a half-spread
+    on entry), so `edge` and sizing are computed against the real fill price.
+    """
     if not (0.0 < yes_price < 1.0):
         return None
 
     if prob_yes >= yes_price:
-        side, price, prob = "YES", yes_price, prob_yes
+        side, base, prob = "YES", yes_price, prob_yes
     else:
-        side, price, prob = "NO", 1.0 - yes_price, 1.0 - prob_yes
+        side, base, prob = "NO", 1.0 - yes_price, 1.0 - prob_yes
+
+    price = base + fee
+    if not (0.0 < price < 1.0):
+        return None
 
     edge = prob - price
     if edge < min_edge:

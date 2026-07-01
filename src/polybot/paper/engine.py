@@ -1,4 +1,10 @@
-"""Paper-trading engine: screen -> decide -> open, and resolve -> close."""
+"""Paper-trading engine.
+
+Two ways a position leaves the book:
+  * resolve()        — the market settled; pay 1/0 on the winning outcome.
+  * mark_and_exit()  — short-horizon (flow) exit at the current mid on
+                        take-profit / stop-loss / max-hold.
+"""
 
 from __future__ import annotations
 
@@ -44,6 +50,39 @@ def settle(
     exit_price = 1.0 if side_won else 0.0
     pnl = shares * exit_price - size_usd
     return exit_price, pnl, side_won
+
+
+def exit_decision(
+    side: str,
+    entry_price: float,
+    current_yes_mid: float,
+    ts_open_iso: str,
+    now: datetime,
+    tp: float,
+    sl: float,
+    max_hold_hours: float,
+    fee: float = 0.0,
+) -> tuple[float, str] | None:
+    """Decide whether to close a flow position now. Returns (exit_price, reason) or None.
+
+    `fee` models the half-spread paid when selling back into the book.
+    """
+    base = current_yes_mid if side == "YES" else 1.0 - current_yes_mid
+    current = base - fee
+    move = current - entry_price  # we are long the side at entry_price
+    if move >= tp:
+        return current, "take_profit"
+    if -move >= sl:
+        return current, "stop_loss"
+    try:
+        opened = datetime.fromisoformat(ts_open_iso)
+    except ValueError:
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    if (now - opened).total_seconds() / 3600.0 >= max_hold_hours:
+        return current, "max_hold"
+    return None
 
 
 class PaperEngine:
@@ -93,6 +132,7 @@ class PaperEngine:
                 if signal is None:
                     continue
 
+                half_spread = (book.spread / 2.0) if (book and book.spread is not None) else 0.0
                 bet = decide_bet(
                     signal.prob_yes,
                     yes_price,
@@ -102,6 +142,7 @@ class PaperEngine:
                     max_position=s.max_position_usd,
                     min_stake=s.min_stake_usd,
                     remaining_exposure=remaining,
+                    fee=half_spread,
                 )
                 if bet is None:
                     continue
@@ -140,6 +181,38 @@ class PaperEngine:
                     continue
                 exit_price, pnl, _ = settle(p.side, p.shares, p.size_usd, winner, market.outcomes)
                 if p.id is not None:
-                    self.store.close_position(p.id, exit_price, pnl, winner, _now_iso())
+                    self.store.close_position(p.id, exit_price, pnl, winner, _now_iso(), "resolution")
                 closed.append((p, pnl))
+        return closed
+
+    async def mark_and_exit(self) -> list[tuple[Position, float, str]]:
+        s = self.s
+        now = datetime.now(timezone.utc)
+        closed: list[tuple[Position, float, str]] = []
+        async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
+            for p in self.store.open_positions():
+                if not p.token_id:
+                    continue
+                try:
+                    book = await clob.fetch_book(p.token_id)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("mark book fetch failed for %s: %s", p.token_id, e)
+                    continue
+                yes_mid = book.mid if book else None
+                if yes_mid is None:
+                    continue
+                half = (book.spread / 2.0) if (book and book.spread is not None) else 0.0
+                decision = exit_decision(
+                    p.side, p.entry_price, yes_mid, p.ts_open, now,
+                    s.exit_take_profit, s.exit_stop_loss, s.exit_max_hold_hours, fee=half,
+                )
+                if decision is None:
+                    continue
+                exit_price, reason = decision
+                pnl = p.shares * exit_price - p.size_usd
+                if p.id is not None:
+                    self.store.close_position(
+                        p.id, exit_price, pnl, f"exit@{exit_price:.3f}", _now_iso(), reason
+                    )
+                closed.append((p, pnl, reason))
         return closed

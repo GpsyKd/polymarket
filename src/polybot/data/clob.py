@@ -68,6 +68,31 @@ class OrderBook:
             return None
         return ba - bb
 
+    def imbalance(self, levels: int = 5) -> float | None:
+        """Signed order-book imbalance over the top `levels` on each side.
+
+        Returns a value in [-1, 1]: positive means bid-heavy (upward pressure).
+        """
+        top_bids = sorted(self.bids, key=lambda x: -x[0])[:levels]
+        top_asks = sorted(self.asks, key=lambda x: x[0])[:levels]
+        bid_depth = sum(s for _, s in top_bids)
+        ask_depth = sum(s for _, s in top_asks)
+        total = bid_depth + ask_depth
+        if total <= 0:
+            return None
+        return (bid_depth - ask_depth) / total
+
+    def microprice(self) -> float | None:
+        """Size-weighted fair value at the top of book (Stoikov microprice)."""
+        bb, ba = self.best_bid, self.best_ask
+        if bb is None or ba is None:
+            return self.mid
+        bid_sz = sum(s for p, s in self.bids if p == bb)
+        ask_sz = sum(s for p, s in self.asks if p == ba)
+        if bid_sz + ask_sz <= 0:
+            return self.mid
+        return (bb * ask_sz + ba * bid_sz) / (bid_sz + ask_sz)
+
 
 class ClobClient:
     def __init__(self, base_url: str, timeout: float = 20.0) -> None:

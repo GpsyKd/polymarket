@@ -26,15 +26,17 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_price REAL,
     pnl_usd REAL,
     outcome TEXT,
+    close_reason TEXT,
     mode TEXT NOT NULL DEFAULT 'paper'
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 """
 
+# Columns written on INSERT (open).
 _COLS = [
     "ts_open", "market_id", "token_id", "question", "side", "entry_price",
     "model_prob", "edge", "size_usd", "shares", "status", "strategy",
-    "rationale", "ts_close", "exit_price", "pnl_usd", "outcome", "mode",
+    "rationale", "mode",
 ]
 
 
@@ -57,6 +59,7 @@ class Position:
     exit_price: float | None = None
     pnl_usd: float | None = None
     outcome: str | None = None
+    close_reason: str | None = None
     mode: str = "paper"
     id: int | None = None
 
@@ -69,7 +72,15 @@ class Storage:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a DB was first created."""
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
+        for col, ddl in (("close_reason", "close_reason TEXT"),):
+            if col not in existing:
+                self.conn.execute(f"ALTER TABLE positions ADD COLUMN {ddl}")
 
     def insert_position(self, pos: Position) -> int:
         values = [getattr(pos, c) for c in _COLS]
@@ -106,12 +117,18 @@ class Storage:
         return float(row["s"] or 0.0)
 
     def close_position(
-        self, pos_id: int, exit_price: float, pnl: float, outcome: str, ts_close: str
+        self,
+        pos_id: int,
+        exit_price: float,
+        pnl: float,
+        outcome: str,
+        ts_close: str,
+        close_reason: str,
     ) -> None:
         self.conn.execute(
             "UPDATE positions SET status='closed', exit_price=?, pnl_usd=?, outcome=?, "
-            "ts_close=? WHERE id=?",
-            (exit_price, pnl, outcome, ts_close, pos_id),
+            "ts_close=?, close_reason=? WHERE id=?",
+            (exit_price, pnl, outcome, ts_close, close_reason, pos_id),
         )
         self.conn.commit()
 

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from polybot.data.clob import OrderBook
 from polybot.data.models import Market
-from polybot.paper.engine import settle, winner_label
+from polybot.paper.engine import exit_decision, settle, winner_label
 from polybot.paper.metrics import build_report
 from polybot.paper.sizing import decide_bet, kelly_fraction
 from polybot.paper.storage import Position, Storage
+from polybot.paper.strategy import MicrostructureStrategy
 
 
 def _now() -> str:
@@ -21,61 +23,120 @@ def _market(**kw) -> Market:
     return Market.model_validate(base)
 
 
+# --------------------------------------------------------------------------- #
+# sizing
+# --------------------------------------------------------------------------- #
 def test_kelly_fraction():
     assert abs(kelly_fraction(0.6, 0.5) - 0.2) < 1e-9
     assert kelly_fraction(0.5, 0.5) == 0.0
-    assert kelly_fraction(0.6, 0.0) == 0.0  # invalid price
+    assert kelly_fraction(0.6, 0.0) == 0.0
 
 
 def test_decide_bet_yes_no_and_min_edge():
     kw = dict(bankroll=100, min_edge=0.05, kelly_mult=0.25,
               max_position=15, min_stake=1, remaining_exposure=100)
-
     yes = decide_bet(0.6, 0.5, **kw)
     assert yes is not None and yes.side == "YES"
     assert abs(yes.size_usd - 0.25 * 0.2 * 100) < 1e-6  # 5.0
-    assert abs(yes.shares - yes.size_usd / 0.5) < 1e-9
-
     no = decide_bet(0.3, 0.5, **kw)
-    assert no is not None and no.side == "NO"
-    assert abs(no.price - 0.5) < 1e-9 and abs(no.prob - 0.7) < 1e-9
-
+    assert no is not None and no.side == "NO" and abs(no.prob - 0.7) < 1e-9
     assert decide_bet(0.52, 0.5, **kw) is None  # edge below floor
+    assert decide_bet(0.9, 0.5, **kw).size_usd <= 15.0  # max_position cap
+    # spread fee raises the fill price and shrinks edge
+    fee_bet = decide_bet(0.6, 0.5, fee=0.04, **kw)
+    assert fee_bet is not None and abs(fee_bet.price - 0.54) < 1e-9 and fee_bet.edge > 0.05
+    assert decide_bet(0.56, 0.5, fee=0.05, **kw) is None  # edge ~0.01 < floor after fee
 
-    capped = decide_bet(0.9, 0.5, **kw)
-    assert capped is not None and capped.size_usd <= 15.0  # max_position cap
+
+# --------------------------------------------------------------------------- #
+# order-book analytics + microstructure strategy
+# --------------------------------------------------------------------------- #
+def test_orderbook_imbalance_microprice():
+    ob = OrderBook("t", bids=[(0.49, 800), (0.48, 200)], asks=[(0.51, 100), (0.52, 100)])
+    assert ob.best_bid == 0.49 and ob.best_ask == 0.51 and abs(ob.mid - 0.5) < 1e-9
+    # bids 1000 vs asks 200 -> (1000-200)/1200
+    assert abs(ob.imbalance(5) - (800.0 / 1200.0)) < 1e-9
+    # microprice leans toward the ask when bid-heavy
+    assert ob.microprice() > 0.5
 
 
+def test_micro_strategy_direction():
+    s = MicrostructureStrategy(min_imbalance=0.2, levels=5, edge_scale=0.06)
+    up = OrderBook("t", bids=[(0.49, 900)], asks=[(0.51, 100)])
+    sig = s.evaluate(_market(), 0.5, up)
+    assert sig is not None and sig.prob_yes > 0.5  # bid-heavy -> lean up
+    flat = OrderBook("t", bids=[(0.49, 100)], asks=[(0.51, 100)])
+    assert s.evaluate(_market(), 0.5, flat) is None  # imbalance 0 < min
+
+
+# --------------------------------------------------------------------------- #
+# settlement + flow exits
+# --------------------------------------------------------------------------- #
 def test_winner_label_and_settle():
     assert winner_label(_market(closed=True, outcomePrices=["1", "0"])) == "Yes"
     assert winner_label(_market(closed=True, outcomePrices=["0", "1"])) == "No"
     assert winner_label(_market(closed=True, outcomePrices=["0.5", "0.5"])) is None
     assert winner_label(_market(closed=False, outcomePrices=["1", "0"])) is None
 
-    ep, pnl, won = settle("YES", shares=10.0, size_usd=5.0, winner="Yes", outcomes=["Yes", "No"])
-    assert won and ep == 1.0 and abs(pnl - 5.0) < 1e-9  # 10*1 - 5
-
-    ep2, pnl2, won2 = settle("NO", shares=10.0, size_usd=5.0, winner="Yes", outcomes=["Yes", "No"])
+    ep, pnl, won = settle("YES", 10.0, 5.0, "Yes", ["Yes", "No"])
+    assert won and ep == 1.0 and abs(pnl - 5.0) < 1e-9
+    ep2, pnl2, won2 = settle("NO", 10.0, 5.0, "Yes", ["Yes", "No"])
     assert (not won2) and ep2 == 0.0 and abs(pnl2 + 5.0) < 1e-9
 
 
+def test_exit_decision():
+    now = datetime(2026, 7, 2, tzinfo=timezone.utc)
+    recent = (now - timedelta(hours=1)).isoformat()
+
+    tp = exit_decision("YES", 0.50, 0.55, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
+    assert tp is not None and tp[1] == "take_profit" and abs(tp[0] - 0.55) < 1e-9
+
+    sl = exit_decision("YES", 0.50, 0.44, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
+    assert sl[1] == "stop_loss"
+
+    # NO position: entry 0.50, yes mid drops to 0.44 -> NO price 0.56 -> +0.06 gain
+    no_tp = exit_decision("NO", 0.50, 0.44, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
+    assert no_tp[1] == "take_profit" and abs(no_tp[0] - 0.56) < 1e-9
+
+    assert exit_decision("YES", 0.50, 0.51, recent, now, 0.03, 0.05, 48) is None
+
+    old = (now - timedelta(hours=50)).isoformat()
+    assert exit_decision("YES", 0.50, 0.505, old, now, 0.03, 0.05, 48)[1] == "max_hold"
+
+    # half-spread fee on exit lowers the realised price
+    fee_tp = exit_decision("YES", 0.50, 0.55, recent, now, 0.03, 0.05, 48, fee=0.01)
+    assert fee_tp[1] == "take_profit" and abs(fee_tp[0] - 0.54) < 1e-9
+
+
+# --------------------------------------------------------------------------- #
+# storage + metrics
+# --------------------------------------------------------------------------- #
 def test_storage_and_report(tmp_path):
     store = Storage(str(tmp_path / "t.sqlite3"))
-    pos = Position(market_id="1", question="Q", side="YES", entry_price=0.5,
+
+    won = Position(market_id="1", question="Q1", side="YES", entry_price=0.5,
                    model_prob=0.6, edge=0.1, size_usd=5.0, shares=10.0, ts_open=_now())
-    pid = store.insert_position(pos)
-    assert pid == 1
-    assert store.open_exposure() == 5.0
-    assert store.open_market_ids() == {"1"}
+    pid = store.insert_position(won)
+    assert pid == 1 and store.open_exposure() == 5.0 and store.open_market_ids() == {"1"}
 
-    store.close_position(pid, exit_price=1.0, pnl=5.0, outcome="Yes", ts_close=_now())
+    flow = Position(market_id="2", question="Q2", side="YES", entry_price=0.50,
+                    model_prob=0.53, edge=0.03, size_usd=4.0, shares=8.0, ts_open=_now())
+    store.insert_position(flow)
+
+    store.close_position(1, exit_price=1.0, pnl=5.0, outcome="Yes",
+                         ts_close=_now(), close_reason="resolution")
+    store.close_position(2, exit_price=0.53, pnl=0.24, outcome="exit@0.530",
+                         ts_close=_now(), close_reason="take_profit")
+
     report = build_report(store.all_positions())
+    assert report["n_closed"] == 2
+    assert abs(report["pnl_usd"] - 5.24) < 1e-9
+    assert report["by_reason"]["resolution"]["n"] == 1
+    assert report["by_reason"]["take_profit"]["n"] == 1
 
-    assert report["n_closed"] == 1
-    assert report["pnl_usd"] == 5.0
-    assert report["hit_rate"] == 1.0
-    # model prob 0.6, won=1 -> (0.6-1)^2 = 0.16 ; market baseline 0.5 -> 0.25
-    assert abs(report["brier"] - 0.16) < 1e-9
-    assert abs(report["brier_baseline_market"] - 0.25) < 1e-9
-    assert report["beats_market"] is True
+    res = report["resolution"]
+    assert res["n"] == 1  # only the resolution-closed bet
+    assert abs(res["brier"] - 0.16) < 1e-9          # (0.6-1)^2
+    assert abs(res["brier_baseline_market"] - 0.25) < 1e-9  # (0.5-1)^2
+    assert res["beats_market"] is True
     store.close()

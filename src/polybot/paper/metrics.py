@@ -1,7 +1,9 @@
 """Calibration & performance metrics over the paper ledger.
 
-The paper->live gate is defined here in spirit: enough closed bets, positive
-ROI after spread, and a Brier score that beats the market-implied baseline.
+ROI / PnL are computed over all closed positions (flow exits + resolutions).
+Brier and calibration are computed only over positions that were held to
+*resolution* (terminal 0/1 outcome) — the paper->live gate for value strategies:
+enough resolved bets, positive ROI after spread, Brier below the market baseline.
 """
 
 from __future__ import annotations
@@ -12,12 +14,8 @@ from typing import Any
 from .storage import Position
 
 
-def _won(p: Position) -> float:
-    return 1.0 if (p.exit_price or 0.0) >= 0.5 else 0.0
-
-
 def build_report(positions: list[Position]) -> dict[str, Any]:
-    closed = [p for p in positions if p.status == "closed" and p.exit_price is not None]
+    closed = [p for p in positions if p.status == "closed"]
     open_ = [p for p in positions if p.status == "open"]
 
     report: dict[str, Any] = {
@@ -26,33 +24,50 @@ def build_report(positions: list[Position]) -> dict[str, Any]:
         "n_closed": len(closed),
         "open_exposure_usd": round(sum(p.size_usd for p in open_), 2),
     }
-
     if not closed:
         return report
 
     staked = sum(p.size_usd for p in closed)
     pnl = sum((p.pnl_usd or 0.0) for p in closed)
-    won = [_won(p) for p in closed]
-
-    brier = mean((p.model_prob - w) ** 2 for p, w in zip(closed, won))
-    brier_market = mean((p.entry_price - w) ** 2 for p, w in zip(closed, won))
-
+    wins = sum(1 for p in closed if (p.pnl_usd or 0.0) > 0)
     report.update({
         "staked_usd": round(staked, 2),
         "pnl_usd": round(pnl, 2),
         "roi": round(pnl / staked, 4) if staked else 0.0,
-        "hit_rate": round(sum(won) / len(closed), 4),
-        "brier": round(brier, 4),
-        "brier_baseline_market": round(brier_market, 4),
-        "beats_market": brier < brier_market,
-        "calibration": _calibration(closed, won),
+        "win_rate": round(wins / len(closed), 4),
+        "by_reason": _by_reason(closed),
     })
+
+    resolved = [p for p in closed if p.close_reason == "resolution" and p.exit_price is not None]
+    if resolved:
+        won = [1.0 if (p.exit_price or 0.0) >= 0.5 else 0.0 for p in resolved]
+        brier = mean((p.model_prob - w) ** 2 for p, w in zip(resolved, won))
+        brier_market = mean((p.entry_price - w) ** 2 for p, w in zip(resolved, won))
+        report["resolution"] = {
+            "n": len(resolved),
+            "brier": round(brier, 4),
+            "brier_baseline_market": round(brier_market, 4),
+            "beats_market": brier < brier_market,
+            "calibration": _calibration(resolved, won),
+        }
     return report
 
 
-def _calibration(closed: list[Position], won: list[float]) -> list[dict[str, Any]]:
+def _by_reason(closed: list[Position]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for p in closed:
+        reason = p.close_reason or "unknown"
+        bucket = out.setdefault(reason, {"n": 0, "pnl": 0.0})
+        bucket["n"] += 1
+        bucket["pnl"] += p.pnl_usd or 0.0
+    for bucket in out.values():
+        bucket["pnl"] = round(bucket["pnl"], 2)
+    return out
+
+
+def _calibration(resolved: list[Position], won: list[float]) -> list[dict[str, Any]]:
     buckets: dict[int, list[tuple[float, float]]] = {}
-    for p, w in zip(closed, won):
+    for p, w in zip(resolved, won):
         b = min(int(p.model_prob * 10), 9)
         buckets.setdefault(b, []).append((p.model_prob, w))
     out = []

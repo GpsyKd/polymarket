@@ -13,7 +13,7 @@ from .logsetup import setup_logging
 from .paper.engine import PaperEngine
 from .paper.metrics import build_report
 from .paper.storage import Storage
-from .paper.strategy import PlaceholderStrategy
+from .paper.strategy import MicrostructureStrategy, PlaceholderStrategy
 from .screener.stage0 import ScreenResult, screen_markets
 
 log = logging.getLogger("polybot")
@@ -51,18 +51,44 @@ def _print_table(results: list[ScreenResult]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# paper-tick / resolve / report
+# paper-tick / mark / resolve / report
 # --------------------------------------------------------------------------- #
-async def _run_tick(top: int, pull: float | None, min_edge: float | None, dry_run: bool) -> None:
+def _build_strategy(name: str, pull: float | None):
+    settings = get_settings()
+    if name == "micro":
+        strat = MicrostructureStrategy(
+            min_imbalance=settings.micro_min_imbalance,
+            levels=settings.micro_depth_levels,
+            edge_scale=settings.micro_edge_scale,
+        )
+        return strat, settings.micro_min_edge
+    strat = PlaceholderStrategy(pull=settings.placeholder_pull if pull is None else pull)
+    return strat, settings.min_edge
+
+
+async def _run_tick(strategy: str, top: int, pull: float | None, min_edge: float | None, dry_run: bool) -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
-    strat = PlaceholderStrategy(pull=settings.placeholder_pull if pull is None else pull)
+    strat, default_edge = _build_strategy(strategy, pull)
+    edge = default_edge if min_edge is None else min_edge
     engine = PaperEngine(settings, store, strat)
-    opened = await engine.tick(top_candidates=top, min_edge=min_edge, dry_run=dry_run)
-    log.info("Opened %d paper position(s)%s", len(opened), " [dry-run]" if dry_run else "")
+    opened = await engine.tick(top_candidates=top, min_edge=edge, dry_run=dry_run)
+    log.info("Opened %d paper position(s) via %s%s",
+             len(opened), strat.name, " [dry-run]" if dry_run else "")
     for p in opened:
-        q = p.question[:50]
-        print(f"  {p.side:<3} entry {p.entry_price:.3f}  ${p.size_usd:5.2f}  edge {p.edge:+.3f}  {q}")
+        print(f"  {p.side:<3} entry {p.entry_price:.3f}  ${p.size_usd:5.2f}  "
+              f"edge {p.edge:+.3f}  {p.question[:48]}")
+    store.close()
+
+
+async def _run_mark() -> None:
+    settings = get_settings()
+    store = Storage(settings.db_path)
+    engine = PaperEngine(settings, store, PlaceholderStrategy())
+    closed = await engine.mark_and_exit()
+    log.info("Marked-to-market: closed %d position(s)", len(closed))
+    for p, pnl, reason in closed:
+        print(f"  {p.side:<3} {reason:<11} pnl ${pnl:+6.2f}  {p.question[:48]}")
     store.close()
 
 
@@ -73,7 +99,7 @@ async def _run_resolve() -> None:
     closed = await engine.resolve()
     log.info("Resolved/closed %d position(s)", len(closed))
     for p, pnl in closed:
-        print(f"  {p.side:<3} pnl ${pnl:+6.2f}  {p.question[:50]}")
+        print(f"  {p.side:<3} pnl ${pnl:+6.2f}  {p.question[:48]}")
     store.close()
 
 
@@ -83,19 +109,24 @@ def _run_report() -> None:
     positions = store.all_positions()
     report = build_report(positions)
 
-    calibration = report.pop("calibration", None)
+    resolution = report.pop("resolution", None)
     print(json.dumps(report, indent=2))
 
-    if calibration:
-        print("\ncalibration (model prob bucket → predicted vs realized win rate):")
-        for row in calibration:
-            print(f"  {row['bucket']}  n={row['n']:>3}  pred={row['pred']:.3f}  actual={row['actual']:.3f}")
+    if resolution:
+        calibration = resolution.pop("calibration", None)
+        print("\nresolution (held-to-settle) metrics:")
+        print(json.dumps(resolution, indent=2))
+        if calibration:
+            print("calibration (model prob bucket → predicted vs realized):")
+            for row in calibration:
+                print(f"  {row['bucket']}  n={row['n']:>3}  "
+                      f"pred={row['pred']:.3f}  actual={row['actual']:.3f}")
 
     open_ = [p for p in positions if p.status == "open"]
     if open_:
         print(f"\nopen positions ({len(open_)}):")
         for p in open_:
-            print(f"  #{p.id:<3} {p.side:<3} {p.entry_price:.3f} ${p.size_usd:5.2f}  {p.question[:50]}")
+            print(f"  #{p.id:<3} {p.side:<3} {p.entry_price:.3f} ${p.size_usd:5.2f}  {p.question[:48]}")
     store.close()
 
 
@@ -111,12 +142,14 @@ def main() -> None:
     screen.add_argument("--max-markets", type=int, default=2000)
 
     tick = sub.add_parser("paper-tick", help="Screen, decide, and open paper positions")
+    tick.add_argument("--strategy", choices=["micro", "placeholder"], default="micro")
     tick.add_argument("--top", type=int, default=30, help="candidates to consider")
     tick.add_argument("--pull", type=float, default=None, help="placeholder strategy strength")
     tick.add_argument("--min-edge", type=float, default=None, help="override min edge")
     tick.add_argument("--dry-run", action="store_true", help="don't persist")
 
-    sub.add_parser("resolve", help="Close paper positions whose markets have resolved")
+    sub.add_parser("mark", help="Mark open positions to market; exit on TP/SL/max-hold")
+    sub.add_parser("resolve", help="Close positions whose markets have resolved")
     sub.add_parser("report", help="Show ledger metrics (ROI, Brier, calibration)")
 
     args = parser.parse_args()
@@ -127,7 +160,9 @@ def main() -> None:
     if cmd == "screen":
         asyncio.run(_run_screen(getattr(args, "top", 25), getattr(args, "max_markets", 2000)))
     elif cmd == "paper-tick":
-        asyncio.run(_run_tick(args.top, args.pull, args.min_edge, args.dry_run))
+        asyncio.run(_run_tick(args.strategy, args.top, args.pull, args.min_edge, args.dry_run))
+    elif cmd == "mark":
+        asyncio.run(_run_mark())
     elif cmd == "resolve":
         asyncio.run(_run_resolve())
     elif cmd == "report":
