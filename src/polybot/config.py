@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     llm_min_confidence: float = 0.55
     llm_analysis_ttl_hours: float = 6.0  # skip re-analyzing a market seen within this window
 
+    # --- Telegram (control + notifications) ---
+    telegram_bot_token: str | None = None  # or env TELEGRAM_BOT_TOKEN
+    telegram_chat_id: str | None = None    # or env TELEGRAM_CHAT_ID
+
     log_level: str = "INFO"
 
 

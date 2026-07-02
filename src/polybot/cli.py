@@ -13,6 +13,13 @@ from .data.gamma import GammaClient
 from .llm.client import LLMClient, resolve_api_key
 from .llm.news_signal import NewsLLMAnalyzer
 from .logsetup import setup_logging
+from .notify.telegram import (
+    ControlState,
+    TelegramClient,
+    command_loop,
+    resolve_bot_token,
+    resolve_chat_id,
+)
 from .paper.engine import PaperEngine
 from .paper.metrics import build_report
 from .paper.storage import Storage
@@ -124,6 +131,18 @@ def _print_opened(opened, show_rationale: bool = False) -> None:
               f"edge {p.edge:+.3f}  {p.question[:44]}{extra}")
 
 
+def _cycle_message(resolved, exited, opened) -> str:
+    parts = []
+    for p, pnl in resolved:
+        parts.append(f"✅ resolved {p.side} ${pnl:+.2f} — {p.question[:40]}")
+    for p, pnl, reason in exited:
+        parts.append(f"↩️ {reason} {p.side} ${pnl:+.2f} — {p.question[:40]}")
+    for p in opened:
+        parts.append(f"➕ {p.side} {p.entry_price:.3f} ${p.size_usd:.2f} "
+                     f"edge {p.edge:+.3f} — {p.question[:40]}")
+    return "\n".join(parts) if parts else "cycle: no changes"
+
+
 async def _run_mark() -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
@@ -180,14 +199,14 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
     settings = get_settings()
     store = Storage(settings.db_path)
     interval = settings.runner_interval_seconds if interval is None else interval
-    client: LLMClient | None = None
+    llm_client: LLMClient | None = None
 
     if strategy == "llm":
-        client = _make_llm_client()
-        if client is None:
+        llm_client = _make_llm_client()
+        if llm_client is None:
             store.close()
             return
-        analyzer = _make_analyzer(client)
+        analyzer = _make_analyzer(llm_client)
         engine = PaperEngine(settings, store, strategy=None)
         edge = settings.min_edge if min_edge is None else min_edge
         strat_name = analyzer.name
@@ -203,39 +222,65 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
         async def do_tick():
             return await engine.tick(top_candidates=top, min_edge=edge)
 
-    log.info("runner start: strategy=%s edge=%.3f interval=%ss%s",
-             strat_name, edge, interval, " [once]" if once else "")
-    cycle = 0
+    control = ControlState()
+    tg_token, tg_chat = resolve_bot_token(settings), resolve_chat_id(settings)
+    tg = TelegramClient(tg_token) if (tg_token and tg_chat and not once) else None
+
+    async def notify(text: str) -> None:
+        if tg:
+            await tg.send_message(tg_chat, text)
+
+    log.info("runner start: strategy=%s edge=%.3f interval=%ss%s telegram=%s",
+             strat_name, edge, interval, " [once]" if once else "", bool(tg))
+
+    async def cycle_loop() -> None:
+        cycle = 0
+        await notify(f"▶️ polybot started — {strat_name}, every {interval}s")
+        try:
+            while True:
+                cycle += 1
+                resolved = await engine.resolve()
+                exited = await engine.mark_and_exit()
+
+                day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+                day_pnl = store.realized_pnl_since(day_ago)
+                if control.paused:
+                    opened = []
+                elif day_pnl <= -settings.daily_loss_limit_usd:
+                    log.warning("KILL-SWITCH: 24h PnL $%.2f <= -$%.2f — no new opens",
+                                day_pnl, settings.daily_loss_limit_usd)
+                    opened = []
+                    await notify(f"🛑 kill-switch: 24h PnL ${day_pnl:.2f} — opens halted")
+                else:
+                    opened = await do_tick()
+
+                log.info(
+                    "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f "
+                    "| 24h_pnl=$%.2f%s",
+                    cycle, len(resolved), len(exited), len(opened),
+                    len(store.open_positions()), store.open_exposure(), day_pnl,
+                    " [paused]" if control.paused else "",
+                )
+                if tg and (opened or exited or resolved):
+                    await notify(_cycle_message(resolved, exited, opened))
+                if once:
+                    break
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
     try:
-        while True:
-            cycle += 1
-            resolved = await engine.resolve()
-            exited = await engine.mark_and_exit()
-
-            day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-            day_pnl = store.realized_pnl_since(day_ago)
-            if day_pnl <= -settings.daily_loss_limit_usd:
-                log.warning("KILL-SWITCH: 24h realized PnL $%.2f <= -$%.2f — no new opens this cycle",
-                            day_pnl, settings.daily_loss_limit_usd)
-                opened = []
-            else:
-                opened = await do_tick()
-
-            log.info(
-                "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f | 24h_pnl=$%.2f",
-                cycle, len(resolved), len(exited), len(opened),
-                len(store.open_positions()), store.open_exposure(), day_pnl,
-            )
-            if once:
-                break
-            await asyncio.sleep(interval)
-    except asyncio.CancelledError:
-        pass
+        if tg:
+            await asyncio.gather(cycle_loop(), command_loop(tg, tg_chat, control, store))
+        else:
+            await cycle_loop()
     finally:
-        if client is not None:
-            await client.aclose()
+        if llm_client is not None:
+            await llm_client.aclose()
+        if tg is not None:
+            await tg.aclose()
         store.close()
-        log.info("runner stopped after %d cycle(s)", cycle)
+        log.info("runner stopped")
 
 
 # --------------------------------------------------------------------------- #
