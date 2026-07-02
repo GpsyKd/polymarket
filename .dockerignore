@@ -1,0 +1,17 @@
+.venv/
+venv/
+env/
+data/
+*.sqlite3
+*.db
+logs/
+*.log
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+.claude/
+tests/

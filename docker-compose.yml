@@ -1,0 +1,12 @@
+services:
+  polybot:
+    build: .
+    image: polybot:latest
+    container_name: polybot
+    restart: unless-stopped
+    env_file:
+      - .env            # cp .env.example .env and fill in keys first
+    volumes:
+      - ./data:/app/data   # persists the SQLite ledger across restarts
+    # Override the strategy/interval here as needed:
+    command: ["run", "--strategy", "micro", "--interval", "900"]
