@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     exit_stop_loss: float = 0.05  # close when side price drops this much
     exit_max_hold_hours: float = 48.0
 
+    # --- Whale-flow strategy (Polymarket data-api) ---
+    data_api_base_url: str = "https://data-api.polymarket.com"
+    whale_min_usd: float = 500.0  # a trade counts as "whale" above this notional
+    whale_edge_scale: float = 0.08
+    whale_min_flow: float = 0.3  # ignore weaker net flow
+    whale_min_edge: float = 0.03
+    whale_trades_limit: int = 100
+
     # --- LLM (news-signal funnel; OpenAI-compatible endpoint, default xAI/Grok) ---
     grok_api_key: str | None = None
     anthropic_api_key: str | None = None

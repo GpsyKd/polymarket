@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from .config import get_settings
+from .data.dataapi import PolymarketDataClient
 from .data.gamma import GammaClient
 from .llm.client import LLMClient, resolve_api_key
 from .llm.news_signal import NewsLLMAnalyzer
@@ -20,6 +21,7 @@ from .notify.telegram import (
     resolve_bot_token,
     resolve_chat_id,
 )
+from .whale.analyzer import WhaleAnalyzer
 from .paper.engine import PaperEngine
 from .paper.metrics import build_report
 from .paper.storage import Storage
@@ -124,6 +126,22 @@ async def _run_llm_tick(top: int, min_edge: float | None, dry_run: bool) -> None
     store.close()
 
 
+async def _run_whale_tick(top: int, min_edge: float | None, dry_run: bool) -> None:
+    settings = get_settings()
+    store = Storage(settings.db_path)
+    edge = settings.whale_min_edge if min_edge is None else min_edge
+    async with PolymarketDataClient(settings.data_api_base_url, settings.http_timeout) as dc:
+        analyzer = WhaleAnalyzer(
+            dc, settings.whale_min_usd, settings.whale_edge_scale,
+            settings.whale_min_flow, settings.whale_trades_limit,
+        )
+        engine = PaperEngine(settings, store)
+        opened = await engine.whale_tick(analyzer, top_candidates=top, min_edge=edge, dry_run=dry_run)
+    log.info("whale-tick opened %d position(s)%s", len(opened), " [dry-run]" if dry_run else "")
+    _print_opened(opened, show_rationale=True)
+    store.close()
+
+
 def _print_opened(opened, show_rationale: bool = False) -> None:
     for p in opened:
         extra = f"  {p.rationale[:44]}" if show_rationale else ""
@@ -200,6 +218,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
     store = Storage(settings.db_path)
     interval = settings.runner_interval_seconds if interval is None else interval
     llm_client: LLMClient | None = None
+    data_client: PolymarketDataClient | None = None
 
     if strategy == "llm":
         llm_client = _make_llm_client()
@@ -213,6 +232,18 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
 
         async def do_tick():
             return await engine.llm_tick(analyzer, top_candidates=top, min_edge=edge)
+    elif strategy == "whale":
+        data_client = PolymarketDataClient(settings.data_api_base_url, settings.http_timeout)
+        analyzer = WhaleAnalyzer(
+            data_client, settings.whale_min_usd, settings.whale_edge_scale,
+            settings.whale_min_flow, settings.whale_trades_limit,
+        )
+        engine = PaperEngine(settings, store)
+        edge = settings.whale_min_edge if min_edge is None else min_edge
+        strat_name = analyzer.name
+
+        async def do_tick():
+            return await engine.whale_tick(analyzer, top_candidates=top, min_edge=edge)
     else:
         strat, default_edge = _build_strategy(strategy, None)
         engine = PaperEngine(settings, store, strat)
@@ -277,6 +308,8 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
     finally:
         if llm_client is not None:
             await llm_client.aclose()
+        if data_client is not None:
+            await data_client.aclose()
         if tg is not None:
             await tg.aclose()
         store.close()
@@ -306,8 +339,13 @@ def main() -> None:
     llm.add_argument("--min-edge", type=float, default=None)
     llm.add_argument("--dry-run", action="store_true")
 
+    whale = sub.add_parser("whale-tick", help="Whale-flow: large-trade lean → open")
+    whale.add_argument("--top", type=int, default=30)
+    whale.add_argument("--min-edge", type=float, default=None)
+    whale.add_argument("--dry-run", action="store_true")
+
     run = sub.add_parser("run", help="Run the paper loop: resolve → mark → tick on an interval")
-    run.add_argument("--strategy", choices=["micro", "placeholder", "llm"], default="micro")
+    run.add_argument("--strategy", choices=["micro", "placeholder", "llm", "whale"], default="micro")
     run.add_argument("--top", type=int, default=30)
     run.add_argument("--interval", type=int, default=None, help="seconds between cycles")
     run.add_argument("--once", action="store_true", help="run a single cycle and exit")
@@ -328,6 +366,8 @@ def main() -> None:
         asyncio.run(_run_tick(args.strategy, args.top, args.pull, args.min_edge, args.dry_run))
     elif cmd == "llm-tick":
         asyncio.run(_run_llm_tick(args.top, args.min_edge, args.dry_run))
+    elif cmd == "whale-tick":
+        asyncio.run(_run_whale_tick(args.top, args.min_edge, args.dry_run))
     elif cmd == "run":
         try:
             asyncio.run(_run_loop(args.strategy, args.top, args.interval, args.once, args.min_edge))

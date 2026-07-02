@@ -276,6 +276,51 @@ class PaperEngine:
 
         return opened
 
+    async def whale_tick(
+        self, analyzer, top_candidates: int = 30, min_edge: float | None = None, dry_run: bool = False
+    ) -> list[Position]:
+        s = self.s
+        edge_floor = s.min_edge if min_edge is None else min_edge
+
+        async with GammaClient(s.gamma_base_url, s.http_timeout) as gamma:
+            markets = await gamma.fetch_markets(max_markets=2000)
+        screened = screen_markets(markets, s)
+        log.info("whale: scanning up to %d candidates", min(top_candidates, len(screened)))
+
+        open_ids, remaining, group_exposure = self._load_state()
+        opened: list[Position] = []
+
+        async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
+            for r in screened[:top_candidates]:
+                if len(opened) >= s.max_new_positions_per_tick or remaining < s.min_stake_usd:
+                    break
+                m = r.market
+                if m.id in open_ids or self._group_full(m, group_exposure) or not m.condition_id:
+                    continue
+
+                book = await self._fetch_book(clob, m)
+                yes_price = book.mid if (book and book.mid is not None) else m.yes_price()
+                if yes_price is None or not (0.0 < yes_price < 1.0):
+                    continue
+                if book and book.spread is not None and book.spread > s.screen_max_spread:
+                    continue
+
+                signal = await analyzer.analyze(m, yes_price)
+                if signal is None:
+                    continue
+
+                pos, used = self._open_position(
+                    m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
+                    dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
+                )
+                if pos is None:
+                    continue
+                opened.append(pos)
+                remaining -= used
+                open_ids.add(m.id)
+
+        return opened
+
     async def resolve(self) -> list[tuple[Position, float]]:
         closed: list[tuple[Position, float]] = []
         async with GammaClient(self.s.gamma_base_url, self.s.http_timeout) as gamma:
