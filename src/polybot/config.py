@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     whale_min_edge: float = 0.03
     whale_trades_limit: int = 100
 
+    # --- Execution (paper/live) ---
+    clob_tick_size: float = 0.01
+
     # --- LLM (news-signal funnel; OpenAI-compatible endpoint, default xAI/Grok) ---
     grok_api_key: str | None = None
     anthropic_api_key: str | None = None

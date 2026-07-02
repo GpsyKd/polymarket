@@ -88,24 +88,21 @@ def test_exit_decision():
     now = datetime(2026, 7, 2, tzinfo=timezone.utc)
     recent = (now - timedelta(hours=1)).isoformat()
 
-    tp = exit_decision("YES", 0.50, 0.55, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
+    # held token entered at 0.50, now 0.55 -> +0.05 gain -> take-profit
+    tp = exit_decision(0.50, 0.55, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
     assert tp is not None and tp[1] == "take_profit" and abs(tp[0] - 0.55) < 1e-9
 
-    sl = exit_decision("YES", 0.50, 0.44, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
+    sl = exit_decision(0.50, 0.44, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
     assert sl[1] == "stop_loss"
 
-    # NO position: entry 0.50, yes mid drops to 0.44 -> NO price 0.56 -> +0.06 gain
-    no_tp = exit_decision("NO", 0.50, 0.44, recent, now, tp=0.03, sl=0.05, max_hold_hours=48)
-    assert no_tp[1] == "take_profit" and abs(no_tp[0] - 0.56) < 1e-9
+    # half-spread fee on exit lowers the realised price
+    fee_tp = exit_decision(0.50, 0.55, recent, now, 0.03, 0.05, 48, fee=0.01)
+    assert fee_tp[1] == "take_profit" and abs(fee_tp[0] - 0.54) < 1e-9
 
-    assert exit_decision("YES", 0.50, 0.51, recent, now, 0.03, 0.05, 48) is None
+    assert exit_decision(0.50, 0.51, recent, now, 0.03, 0.05, 48) is None
 
     old = (now - timedelta(hours=50)).isoformat()
-    assert exit_decision("YES", 0.50, 0.505, old, now, 0.03, 0.05, 48)[1] == "max_hold"
-
-    # half-spread fee on exit lowers the realised price
-    fee_tp = exit_decision("YES", 0.50, 0.55, recent, now, 0.03, 0.05, 48, fee=0.01)
-    assert fee_tp[1] == "take_profit" and abs(fee_tp[0] - 0.54) < 1e-9
+    assert exit_decision(0.50, 0.505, old, now, 0.03, 0.05, 48)[1] == "max_hold"
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +184,8 @@ def test_realized_pnl_since(tmp_path):
 
 
 def test_open_position_group_cap(tmp_path):
+    import asyncio
+
     from polybot.config import Settings
     from polybot.paper.engine import PaperEngine
 
@@ -195,17 +194,17 @@ def test_open_position_group_cap(tmp_path):
         max_exposure_per_group_usd=3.0, min_stake_usd=1.0, max_position_usd=15.0,
         bankroll_usd=100.0, kelly_fraction=0.25, max_total_exposure_usd=80.0,
     )
-    engine = PaperEngine(settings, store)
+    engine = PaperEngine(settings, store)  # defaults to PaperExecutor
     m = _market(negRiskMarketID="0xG")
 
     ge: dict[str, float] = {}
-    pos, used = engine._open_position(m, 0.5, None, 0.7, 0.05, 100.0, ge,
-                                      dry_run=False, strategy_name="t", rationale="r")
+    pos, used = asyncio.run(engine._open_position(
+        m, 0.5, None, 0.7, 0.05, 100.0, ge, dry_run=False, strategy_name="t", rationale="r"))
     assert pos is not None and used > 0 and ge["neg:0xG"] == used
     assert used <= 3.0 + 1e-9  # clamped to the group budget
 
     # group already full → no position
-    pos2, used2 = engine._open_position(m, 0.5, None, 0.7, 0.05, 100.0, {"neg:0xG": 3.0},
-                                        dry_run=True, strategy_name="t", rationale="r")
+    pos2, used2 = asyncio.run(engine._open_position(
+        m, 0.5, None, 0.7, 0.05, 100.0, {"neg:0xG": 3.0}, dry_run=True, strategy_name="t", rationale="r"))
     assert pos2 is None and used2 == 0.0
     store.close()

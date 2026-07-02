@@ -1,12 +1,13 @@
-"""Paper-trading engine.
+"""Trading engine (paper or live, depending on the injected Executor).
 
 Positions leave the book two ways:
   * resolve()        — the market settled; pay 1/0 on the winning outcome.
   * mark_and_exit()  — short-horizon (flow) exit at the current mid on
                         take-profit / stop-loss / max-hold.
 
-Positions are opened by tick() (a per-market Strategy) or llm_tick() (the
-batch news+LLM funnel); both share _open_position() for sizing + risk caps.
+Positions are opened by tick() (a per-market Strategy), llm_tick() (the news+LLM
+funnel), or whale_tick() (large-trade flow); all share _open_position() for
+sizing, risk caps, and execution.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from ..config import Settings
 from ..data.clob import ClobClient, OrderBook
 from ..data.gamma import GammaClient
 from ..data.models import Market
+from ..execution.base import Executor, Fill
+from ..execution.paper import PaperExecutor
 from ..screener.stage0 import screen_markets
 from .sizing import decide_bet
 from .storage import Position, Storage
@@ -56,9 +59,8 @@ def settle(
 
 
 def exit_decision(
-    side: str,
     entry_price: float,
-    current_yes_mid: float,
+    current_price: float,
     ts_open_iso: str,
     now: datetime,
     tp: float,
@@ -66,13 +68,13 @@ def exit_decision(
     max_hold_hours: float,
     fee: float = 0.0,
 ) -> tuple[float, str] | None:
-    """Decide whether to close a flow position now. Returns (exit_price, reason) or None.
+    """Decide whether to close a flow position now, using the held token's price.
 
-    `fee` models the half-spread paid when selling back into the book.
+    `current_price` is the current mid of the token we hold; `fee` models the
+    half-spread paid when selling back into the book. Returns (exit_price, reason).
     """
-    base = current_yes_mid if side == "YES" else 1.0 - current_yes_mid
-    current = base - fee
-    move = current - entry_price  # we are long the side at entry_price
+    current = current_price - fee
+    move = current - entry_price  # we are long the held token at entry_price
     if move >= tp:
         return current, "take_profit"
     if -move >= sl:
@@ -88,11 +90,26 @@ def exit_decision(
     return None
 
 
+def _token_for_side(market: Market, side: str) -> str | None:
+    """The token we actually hold for a bet: outcome[0] for YES, outcome[1] for NO."""
+    tokens = market.clob_token_ids
+    if side == "YES":
+        return tokens[0] if tokens else None
+    return tokens[1] if len(tokens) >= 2 else None
+
+
 class PaperEngine:
-    def __init__(self, settings: Settings, storage: Storage, strategy: Strategy | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        storage: Storage,
+        strategy: Strategy | None = None,
+        executor: Executor | None = None,
+    ) -> None:
         self.s = settings
         self.store = storage
         self.strategy = strategy
+        self.executor: Executor = executor or PaperExecutor()
 
     def _load_state(self) -> tuple[set[str], float, dict[str, float]]:
         open_ids = self.store.open_market_ids()
@@ -104,7 +121,7 @@ class PaperEngine:
         left = self.s.max_exposure_per_group_usd - group_exposure.get(market.group_key(), 0.0)
         return left < self.s.min_stake_usd
 
-    def _open_position(
+    async def _open_position(
         self,
         market: Market,
         yes_price: float,
@@ -139,26 +156,37 @@ class PaperEngine:
         if bet is None:
             return None, 0.0
 
+        token_id = _token_for_side(market, bet.side)
+        tick_size = (book.tick_size if (book and book.tick_size) else s.clob_tick_size)
+
+        # dry-run never touches the executor (so it can never place a real order).
+        if dry_run:
+            fill: Fill | None = Fill(price=bet.price, shares=bet.shares, size_usd=bet.size_usd)
+        else:
+            fill = await self.executor.buy(token_id, bet.price, bet.size_usd, tick_size)
+        if fill is None or fill.size_usd <= 0.0 or fill.shares <= 0.0:
+            return None, 0.0
+
         pos = Position(
             market_id=market.id,
-            token_id=market.clob_token_ids[0] if market.clob_token_ids else None,
+            token_id=token_id,
             question=market.question,
             side=bet.side,
-            entry_price=bet.price,
+            entry_price=fill.price,
             model_prob=bet.prob,
-            edge=bet.edge,
-            size_usd=bet.size_usd,
-            shares=bet.shares,
+            edge=bet.prob - fill.price,
+            size_usd=fill.size_usd,
+            shares=fill.shares,
             ts_open=_now_iso(),
             strategy=strategy_name,
             rationale=rationale,
             group_key=gkey,
-            mode="paper",
+            mode=self.executor.mode,
         )
         if not dry_run:
             pos.id = self.store.insert_position(pos)
-        group_exposure[gkey] = group_exposure.get(gkey, 0.0) + bet.size_usd
-        return pos, bet.size_usd
+        group_exposure[gkey] = group_exposure.get(gkey, 0.0) + fill.size_usd
+        return pos, fill.size_usd
 
     async def _fetch_book(self, clob: ClobClient, market: Market) -> OrderBook | None:
         token = market.clob_token_ids[0] if market.clob_token_ids else None
@@ -205,7 +233,7 @@ class PaperEngine:
                 if signal is None:
                     continue
 
-                pos, used = self._open_position(
+                pos, used = await self._open_position(
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=self.strategy.name, rationale=signal.rationale,
                 )
@@ -228,7 +256,6 @@ class PaperEngine:
         screened = screen_markets(markets, s)
         candidates = [r.market for r in screened[: max(top_candidates, s.llm_triage_batch)]][: s.llm_triage_batch]
 
-        # Skip markets analyzed within the TTL window (cost guard).
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=s.llm_analysis_ttl_hours)).isoformat()
         recent = self.store.recently_analyzed_ids(cutoff)
         before = len(candidates)
@@ -264,7 +291,7 @@ class PaperEngine:
                 if signal is None:
                     continue
 
-                pos, used = self._open_position(
+                pos, used = await self._open_position(
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
                 )
@@ -309,7 +336,7 @@ class PaperEngine:
                 if signal is None:
                     continue
 
-                pos, used = self._open_position(
+                pos, used = await self._open_position(
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
                 )
@@ -350,21 +377,26 @@ class PaperEngine:
                 except Exception as e:  # noqa: BLE001
                     log.debug("mark book fetch failed for %s: %s", p.token_id, e)
                     continue
-                yes_mid = book.mid if book else None
-                if yes_mid is None:
+                held_mid = book.mid if book else None
+                if held_mid is None:
                     continue
                 half = (book.spread / 2.0) if (book and book.spread is not None) else 0.0
                 decision = exit_decision(
-                    p.side, p.entry_price, yes_mid, p.ts_open, now,
+                    p.entry_price, held_mid, p.ts_open, now,
                     s.exit_take_profit, s.exit_stop_loss, s.exit_max_hold_hours, fee=half,
                 )
                 if decision is None:
                     continue
-                exit_price, reason = decision
-                pnl = p.shares * exit_price - p.size_usd
+                target_price, reason = decision
+
+                tick_size = book.tick_size if (book and book.tick_size) else s.clob_tick_size
+                fill = await self.executor.sell(p.token_id, target_price, p.shares, tick_size)
+                if fill is None:
+                    continue
+                pnl = fill.shares * fill.price - p.size_usd
                 if p.id is not None:
                     self.store.close_position(
-                        p.id, exit_price, pnl, f"exit@{exit_price:.3f}", _now_iso(), reason
+                        p.id, fill.price, pnl, f"exit@{fill.price:.3f}", _now_iso(), reason
                     )
                 closed.append((p, pnl, reason))
         return closed
