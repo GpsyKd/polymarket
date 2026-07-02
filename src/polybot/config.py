@@ -69,6 +69,12 @@ class Settings(BaseSettings):
 
     # --- Execution (paper/live) ---
     clob_tick_size: float = 0.01
+    clob_chain_id: int = 137          # Polygon mainnet
+    clob_signature_type: int = 0      # 0=EOA, 1=email/Magic, 2=browser proxy
+    clob_funder: str | None = None    # proxy/funder address (signature types 1/2)
+    clob_slippage: float = 0.02
+    polygon_private_key: str | None = None  # or env POLYGON_PRIVATE_KEY
+    live_confirm: str | None = None   # must equal "I_UNDERSTAND_LIVE_RISK" to arm real orders
 
     # --- LLM (news-signal funnel; OpenAI-compatible endpoint, default xAI/Grok) ---
     grok_api_key: str | None = None

@@ -94,6 +94,30 @@ def _make_analyzer(client: LLMClient) -> NewsLLMAnalyzer:
     )
 
 
+def _build_executor(settings):
+    """Paper executor unless mode=live with a key; live is dry until explicitly armed."""
+    from .execution.paper import PaperExecutor
+    if settings.mode != "live":
+        return PaperExecutor()
+    import os
+    key = settings.polygon_private_key or os.environ.get("POLYGON_PRIVATE_KEY")
+    if not key:
+        log.error("mode=live but no POLYGON_PRIVATE_KEY — falling back to paper executor")
+        return PaperExecutor()
+    try:
+        from .execution.live import LIVE_CONFIRM_SENTINEL, LiveExecutor
+        executor = LiveExecutor(settings, private_key=key)
+    except Exception as e:  # noqa: BLE001
+        log.error("failed to init live executor (%s) — falling back to paper", e)
+        return PaperExecutor()
+    if executor.armed:
+        log.warning("⚠️  LIVE TRADING ARMED — real orders will be placed with real funds.")
+    else:
+        log.warning("LIVE mode is DRY (orders logged, not posted). Arm with POLYBOT_LIVE_CONFIRM=%s.",
+                    LIVE_CONFIRM_SENTINEL)
+    return executor
+
+
 # --------------------------------------------------------------------------- #
 # open / mark / resolve / report
 # --------------------------------------------------------------------------- #
@@ -210,6 +234,15 @@ def _run_report() -> None:
     store.close()
 
 
+async def _run_balance() -> None:
+    settings = get_settings()
+    executor = _build_executor(settings)
+    bal = await executor.usdc_balance()
+    print(f"executor mode: {executor.mode}")
+    print(f"USDC balance: {'n/a (paper)' if bal is None else f'${bal:.2f}'}")
+    await executor.aclose()
+
+
 # --------------------------------------------------------------------------- #
 # run loop
 # --------------------------------------------------------------------------- #
@@ -217,6 +250,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
     settings = get_settings()
     store = Storage(settings.db_path)
     interval = settings.runner_interval_seconds if interval is None else interval
+    executor = _build_executor(settings)
     llm_client: LLMClient | None = None
     data_client: PolymarketDataClient | None = None
 
@@ -226,7 +260,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
             store.close()
             return
         analyzer = _make_analyzer(llm_client)
-        engine = PaperEngine(settings, store, strategy=None)
+        engine = PaperEngine(settings, store, strategy=None, executor=executor)
         edge = settings.min_edge if min_edge is None else min_edge
         strat_name = analyzer.name
 
@@ -238,7 +272,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
             data_client, settings.whale_min_usd, settings.whale_edge_scale,
             settings.whale_min_flow, settings.whale_trades_limit,
         )
-        engine = PaperEngine(settings, store)
+        engine = PaperEngine(settings, store, executor=executor)
         edge = settings.whale_min_edge if min_edge is None else min_edge
         strat_name = analyzer.name
 
@@ -246,7 +280,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
             return await engine.whale_tick(analyzer, top_candidates=top, min_edge=edge)
     else:
         strat, default_edge = _build_strategy(strategy, None)
-        engine = PaperEngine(settings, store, strat)
+        engine = PaperEngine(settings, store, strat, executor=executor)
         edge = default_edge if min_edge is None else min_edge
         strat_name = strat.name
 
@@ -261,12 +295,12 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
         if tg:
             await tg.send_message(tg_chat, text)
 
-    log.info("runner start: strategy=%s edge=%.3f interval=%ss%s telegram=%s",
-             strat_name, edge, interval, " [once]" if once else "", bool(tg))
+    log.info("runner start: strategy=%s mode=%s edge=%.3f interval=%ss%s telegram=%s",
+             strat_name, executor.mode, edge, interval, " [once]" if once else "", bool(tg))
 
     async def cycle_loop() -> None:
         cycle = 0
-        await notify(f"▶️ polybot started — {strat_name}, every {interval}s")
+        await notify(f"▶️ polybot started — {strat_name}, mode={executor.mode}, every {interval}s")
         try:
             while True:
                 cycle += 1
@@ -312,6 +346,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
             await data_client.aclose()
         if tg is not None:
             await tg.aclose()
+        await executor.aclose()
         store.close()
         log.info("runner stopped")
 
@@ -354,6 +389,7 @@ def main() -> None:
     sub.add_parser("mark", help="Mark open positions to market; exit on TP/SL/max-hold")
     sub.add_parser("resolve", help="Close positions whose markets have resolved")
     sub.add_parser("report", help="Show ledger metrics (ROI, Brier, calibration)")
+    sub.add_parser("balance", help="Show executor mode and USDC balance (live)")
 
     args = parser.parse_args()
     settings = get_settings()
@@ -379,6 +415,8 @@ def main() -> None:
         asyncio.run(_run_resolve())
     elif cmd == "report":
         _run_report()
+    elif cmd == "balance":
+        asyncio.run(_run_balance())
     else:
         parser.print_help()
 

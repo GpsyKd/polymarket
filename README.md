@@ -81,3 +81,16 @@ docker compose logs -f    # смотреть логи
 ```
 
 Леджер (SQLite) сохраняется в `./data` (том), переживает рестарты. Стратегию/интервал менять в `command:` в [docker-compose.yml](docker-compose.yml) (`--strategy micro|llm|whale`). Управление на ходу — через Telegram (`/status`, `/pause`, `/resume`).
+
+## Live-исполнение (реальные деньги) ⚠️
+
+По умолчанию всё **paper**. Live включается осознанно и защищён в несколько слоёв:
+
+1. `pip install ".[live]"` — ставит `py-clob-client-v2` (Polymarket CLOB V2).
+2. В `.env`: `POLYBOT_MODE=live`, `POLYBOT_POLYGON_PRIVATE_KEY=...` (кошелёк Polygon с USDC); при необходимости `POLYBOT_CLOB_SIGNATURE_TYPE` / `POLYBOT_CLOB_FUNDER` под тип аккаунта (EOA / proxy).
+3. Пока **не** задан `POLYBOT_LIVE_CONFIRM=I_UNDERSTAND_LIVE_RISK` — режим **dry-live**: намерение ордера логируется, но ничего не отправляется (безопасная проверка против реального клиента/рынка без трат).
+4. Только с `POLYBOT_LIVE_CONFIRM=I_UNDERSTAND_LIVE_RISK` бот реально ставит ордера.
+
+Защиты: хард-кап на размер позиции, лимит суммарной экспозиции, дневной stop-loss (kill-switch), корреляционный лимит, `/pause` в Telegram. Нет SDK или ключа → автоматический откат на paper. `polybot balance` — показать режим и баланс USDC.
+
+> ⚠️ `py-clob-client-v2` новый (CLOB V2, 2026) и этот путь **не тестировался на реальных средствах** при разработке. Первый живой ордер — вручную, крохотной суммой, под наблюдением; проверь `signature_type`/`funder`, USDC-allowances и разбор ответа ордера. Включать live только после успешного прохождения paper-gate.

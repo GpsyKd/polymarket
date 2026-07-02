@@ -17,6 +17,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+live = [
+    "py-clob-client-v2",
+]
 
 [project.scripts]
 polybot = "polybot.cli:main"
