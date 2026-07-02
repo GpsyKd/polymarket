@@ -12,7 +12,7 @@ batch news+LLM funnel); both share _open_position() for sizing + risk caps.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ..config import Settings
 from ..data.clob import ClobClient, OrderBook
@@ -228,8 +228,16 @@ class PaperEngine:
         screened = screen_markets(markets, s)
         candidates = [r.market for r in screened[: max(top_candidates, s.llm_triage_batch)]][: s.llm_triage_batch]
 
+        # Skip markets analyzed within the TTL window (cost guard).
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=s.llm_analysis_ttl_hours)).isoformat()
+        recent = self.store.recently_analyzed_ids(cutoff)
+        before = len(candidates)
+        candidates = [m for m in candidates if m.id not in recent]
+        skipped = before - len(candidates)
+
         selected = await analyzer.triage(candidates, s.llm_max_deep)
-        log.info("llm triage: %d candidates -> %d selected", len(candidates), len(selected))
+        log.info("llm triage: %d fresh candidates -> %d selected (%d skipped, analyzed <%.0fh ago)",
+                 len(candidates), len(selected), skipped, s.llm_analysis_ttl_hours)
 
         open_ids, remaining, group_exposure = self._load_state()
         opened: list[Position] = []
@@ -249,6 +257,10 @@ class PaperEngine:
                     continue
 
                 signal = await analyzer.deep_analyze(m, yes_price)
+                if signal is not None and not dry_run:
+                    self.store.record_analysis(
+                        m.id, signal.prob_yes, signal.confidence, analyzer.deep_model, _now_iso()
+                    )
                 if signal is None:
                     continue
 

@@ -164,6 +164,28 @@ def test_exposure_by_group(tmp_path):
     store.close()
 
 
+def test_recently_analyzed(tmp_path):
+    store = Storage(str(tmp_path / "a.sqlite3"))
+    store.record_analysis("1", 0.6, 0.8, "grok-4.3", "2026-07-02T10:00:00+00:00")
+    store.record_analysis("2", 0.4, 0.7, "grok-4.3", "2026-07-02T08:00:00+00:00")
+    assert store.recently_analyzed_ids("2026-07-02T09:00:00+00:00") == {"1"}
+    assert store.recently_analyzed_ids("2026-07-02T07:00:00+00:00") == {"1", "2"}
+    assert store.recently_analyzed_ids("2026-07-02T11:00:00+00:00") == set()
+    store.close()
+
+
+def test_realized_pnl_since(tmp_path):
+    store = Storage(str(tmp_path / "p.sqlite3"))
+    store.insert_position(Position(
+        market_id="1", question="Q", side="YES", entry_price=0.5, model_prob=0.6,
+        edge=0.1, size_usd=5.0, shares=10.0, ts_open=_now(),
+    ))
+    store.close_position(1, 0.0, -5.0, "No", "2026-07-02T10:00:00+00:00", "resolution")
+    assert store.realized_pnl_since("2026-07-02T09:00:00+00:00") == -5.0
+    assert store.realized_pnl_since("2026-07-02T11:00:00+00:00") == 0.0
+    store.close()
+
+
 def test_open_position_group_cap(tmp_path):
     from polybot.config import Settings
     from polybot.paper.engine import PaperEngine

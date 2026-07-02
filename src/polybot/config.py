@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     llm_triage_batch: int = 30
     llm_max_deep: int = 6
     llm_min_confidence: float = 0.55
+    llm_analysis_ttl_hours: float = 6.0  # skip re-analyzing a market seen within this window
 
     log_level: str = "INFO"
 

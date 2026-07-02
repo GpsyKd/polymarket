@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 from .config import get_settings
 from .data.gamma import GammaClient
@@ -210,11 +211,20 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
             cycle += 1
             resolved = await engine.resolve()
             exited = await engine.mark_and_exit()
-            opened = await do_tick()
+
+            day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            day_pnl = store.realized_pnl_since(day_ago)
+            if day_pnl <= -settings.daily_loss_limit_usd:
+                log.warning("KILL-SWITCH: 24h realized PnL $%.2f <= -$%.2f — no new opens this cycle",
+                            day_pnl, settings.daily_loss_limit_usd)
+                opened = []
+            else:
+                opened = await do_tick()
+
             log.info(
-                "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f",
+                "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f | 24h_pnl=$%.2f",
                 cycle, len(resolved), len(exited), len(opened),
-                len(store.open_positions()), store.open_exposure(),
+                len(store.open_positions()), store.open_exposure(), day_pnl,
             )
             if once:
                 break

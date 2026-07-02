@@ -31,6 +31,17 @@ CREATE TABLE IF NOT EXISTS positions (
     mode TEXT NOT NULL DEFAULT 'paper'
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+
+CREATE TABLE IF NOT EXISTS analysis_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    prob_yes REAL,
+    confidence REAL,
+    model TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_market ON analysis_log(market_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_ts ON analysis_log(ts);
 """
 
 # Columns written on INSERT (open).
@@ -140,6 +151,31 @@ class Storage:
             (exit_price, pnl, outcome, ts_close, close_reason, pos_id),
         )
         self.conn.commit()
+
+    def record_analysis(
+        self, market_id: str, prob_yes: float | None, confidence: float | None,
+        model: str, ts: str,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO analysis_log (ts, market_id, prob_yes, confidence, model) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts, market_id, prob_yes, confidence, model),
+        )
+        self.conn.commit()
+
+    def recently_analyzed_ids(self, since_iso: str) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT market_id FROM analysis_log WHERE ts >= ?", (since_iso,)
+        ).fetchall()
+        return {r["market_id"] for r in rows}
+
+    def realized_pnl_since(self, since_iso: str) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(pnl_usd), 0) AS s FROM positions "
+            "WHERE status='closed' AND ts_close >= ?",
+            (since_iso,),
+        ).fetchone()
+        return float(row["s"] or 0.0)
 
     def close(self) -> None:
         self.conn.close()
