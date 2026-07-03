@@ -482,3 +482,21 @@ class PaperEngine:
                     )
                 closed.append((p, pnl, reason))
         return closed
+
+    async def unrealized_pnl(self) -> float:
+        """Mark-to-market PnL of all open positions — for the drawdown kill-switch,
+        which realized-only PnL would miss until positions actually close."""
+        total = 0.0
+        async with ClobClient(self.s.clob_base_url, self.s.http_timeout) as clob:
+            for p in self.store.open_positions(mode=self.executor.mode):
+                if not p.token_id:
+                    continue
+                try:
+                    book = await clob.fetch_book(p.token_id)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("unrealized book fetch failed for %s: %s", p.token_id, e)
+                    continue
+                mid = book.mid if book else None
+                if mid is not None:
+                    total += p.shares * mid - p.size_usd
+        return total

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from .config import get_settings
@@ -261,45 +262,79 @@ async def _run_balance() -> None:
 # --------------------------------------------------------------------------- #
 # run loop
 # --------------------------------------------------------------------------- #
+def _build_run_context(strategy, settings, store, executor, top, min_edge):
+    """Build one ticker per strategy (each with its own interval) + clients to close.
+
+    `strategy` is a single signal name or "all". Every ticker shares the same
+    store + executor; resolve/mark/kill-switch run once per cycle over all of them.
+    """
+    names = ["micro", "llm", "whale"] if strategy == "all" else [strategy]
+    tickers: list[dict] = []
+    closers: list = []
+
+    for name in names:
+        if name == "llm":
+            client = _make_llm_client()
+            if client is None:
+                if strategy == "all":
+                    log.warning("skipping llm signal (no API key)")
+                    continue
+                return [], []
+            closers.append(client)
+            analyzer = _make_analyzer(client)
+            engine = PaperEngine(settings, store, strategy=None, executor=executor)
+            edge = settings.min_edge if min_edge is None else min_edge
+
+            def _mk(engine=engine, analyzer=analyzer, edge=edge):
+                async def do_tick():
+                    return await engine.llm_tick(analyzer, top_candidates=top, min_edge=edge)
+                return do_tick
+            tickers.append({"name": analyzer.name, "interval": settings.llm_interval_seconds, "do_tick": _mk()})
+        elif name == "whale":
+            dc = PolymarketDataClient(settings.data_api_base_url, settings.http_timeout)
+            closers.append(dc)
+            analyzer = _make_whale_analyzer(dc)
+            engine = PaperEngine(settings, store, executor=executor)
+            edge = settings.whale_min_edge if min_edge is None else min_edge
+
+            def _mk(engine=engine, analyzer=analyzer, edge=edge):
+                async def do_tick():
+                    return await engine.whale_tick(analyzer, top_candidates=top, min_edge=edge)
+                return do_tick
+            tickers.append({"name": analyzer.name, "interval": settings.runner_interval_seconds, "do_tick": _mk()})
+        else:
+            strat, default_edge = _build_strategy(name, None)
+            engine = PaperEngine(settings, store, strat, executor=executor)
+            edge = default_edge if min_edge is None else min_edge
+
+            def _mk(engine=engine, edge=edge):
+                async def do_tick():
+                    return await engine.tick(top_candidates=top, min_edge=edge)
+                return do_tick
+            tickers.append({"name": strat.name, "interval": settings.runner_interval_seconds, "do_tick": _mk()})
+
+    return tickers, closers
+
+
 async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, min_edge: float | None) -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
-    if interval is None:
-        # News moves on minutes-to-hours; ticking the LLM funnel every 5 min just burns API budget.
-        interval = settings.llm_interval_seconds if strategy == "llm" else settings.runner_interval_seconds
     executor = _build_executor(settings)
-    llm_client: LLMClient | None = None
-    data_client: PolymarketDataClient | None = None
 
-    if strategy == "llm":
-        llm_client = _make_llm_client()
-        if llm_client is None:
-            store.close()
-            return
-        analyzer = _make_analyzer(llm_client)
-        engine = PaperEngine(settings, store, strategy=None, executor=executor)
-        edge = settings.min_edge if min_edge is None else min_edge
-        strat_name = analyzer.name
+    tickers, closers = _build_run_context(strategy, settings, store, executor, top, min_edge)
+    if not tickers:
+        await executor.aclose()
+        store.close()
+        return
+    if interval is not None:  # explicit --interval overrides every strategy's cadence
+        for t in tickers:
+            t["interval"] = interval
 
-        async def do_tick():
-            return await engine.llm_tick(analyzer, top_candidates=top, min_edge=edge)
-    elif strategy == "whale":
-        data_client = PolymarketDataClient(settings.data_api_base_url, settings.http_timeout)
-        analyzer = _make_whale_analyzer(data_client)
-        engine = PaperEngine(settings, store, executor=executor)
-        edge = settings.whale_min_edge if min_edge is None else min_edge
-        strat_name = analyzer.name
-
-        async def do_tick():
-            return await engine.whale_tick(analyzer, top_candidates=top, min_edge=edge)
-    else:
-        strat, default_edge = _build_strategy(strategy, None)
-        engine = PaperEngine(settings, store, strat, executor=executor)
-        edge = default_edge if min_edge is None else min_edge
-        strat_name = strat.name
-
-        async def do_tick():
-            return await engine.tick(top_candidates=top, min_edge=edge)
+    maint = PaperEngine(settings, store, executor=executor)  # shared resolve/mark/unrealized
+    strat_names = "+".join(t["name"] for t in tickers)
+    # Wake at least every 5 min for maintenance / pause / kill-switch, but each
+    # strategy still ticks only on its own (possibly longer) interval.
+    base = max(60, min(300, min(t["interval"] for t in tickers)))
 
     control = ControlState.load(store)  # /pause survives restarts
     tg_token, tg_chat = resolve_bot_token(settings), resolve_chat_id(settings)
@@ -309,46 +344,53 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
         if tg:
             await tg.send_message(tg_chat, text)
 
-    log.info("runner start: strategy=%s mode=%s edge=%.3f interval=%ss%s telegram=%s paused=%s",
-             strat_name, executor.mode, edge, interval, " [once]" if once else "", bool(tg),
-             control.paused)
+    log.info("runner start: strategies=%s mode=%s base=%ss%s telegram=%s paused=%s",
+             strat_names, executor.mode, base, " [once]" if once else "", bool(tg), control.paused)
 
     async def cycle_loop() -> None:
+        last: dict[str, float] = {t["name"]: -1e9 for t in tickers}  # all due on cycle 1
         cycle = 0
         kill_active = False
-        await notify(f"▶️ polybot started — {strat_name}, mode={executor.mode}, every {interval}s"
+        await notify(f"▶️ polybot started — [{strat_names}], mode={executor.mode}"
                      + (" [paused]" if control.paused else ""))
         try:
             while True:
                 cycle += 1
                 # One flaky network call must not take the 24/7 runner down.
                 try:
-                    resolved = await engine.resolve()
-                    exited = await engine.mark_and_exit()
+                    now = time.monotonic()
+                    resolved = await maint.resolve()
+                    exited = await maint.mark_and_exit()
 
                     day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-                    day_pnl = store.realized_pnl_since(day_ago, mode=executor.mode)
+                    realized = store.realized_pnl_since(day_ago, mode=executor.mode)
+                    unrealized = await maint.unrealized_pnl()
+                    total_pnl = realized + unrealized
+
+                    opened: list = []
                     if control.paused:
-                        opened = []
-                    elif day_pnl <= -settings.daily_loss_limit_usd:
-                        opened = []
-                        log.warning("KILL-SWITCH: 24h PnL $%.2f <= -$%.2f — no new opens",
-                                    day_pnl, settings.daily_loss_limit_usd)
-                        if not kill_active:  # notify on transition only, not every cycle
+                        pass
+                    elif total_pnl <= -settings.daily_loss_limit_usd:
+                        log.warning("KILL-SWITCH: PnL $%.2f (24h real $%.2f + open $%.2f) <= -$%.2f — no new opens",
+                                    total_pnl, realized, unrealized, settings.daily_loss_limit_usd)
+                        if not kill_active:
                             kill_active = True
-                            await notify(f"🛑 kill-switch: 24h PnL ${day_pnl:.2f} — opens halted")
+                            await notify(f"🛑 kill-switch: PnL ${total_pnl:.2f} (open ${unrealized:.2f}) — opens halted")
                     else:
                         if kill_active:
                             kill_active = False
                             await notify("✅ kill-switch cleared — opens resumed")
-                        opened = await do_tick()
+                        for t in tickers:
+                            if now - last[t["name"]] >= t["interval"]:
+                                last[t["name"]] = now
+                                opened += await t["do_tick"]()
 
                     log.info(
                         "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f "
-                        "| 24h_pnl=$%.2f%s",
+                        "| pnl 24h=$%.2f open=$%.2f%s",
                         cycle, len(resolved), len(exited), len(opened),
                         len(store.open_positions(mode=executor.mode)),
-                        store.open_exposure(mode=executor.mode), day_pnl,
+                        store.open_exposure(mode=executor.mode), realized, unrealized,
                         " [paused]" if control.paused else "",
                     )
                     if tg and (opened or exited or resolved):
@@ -359,7 +401,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
                     log.exception("cycle %d failed; retrying next interval", cycle)
                 if once:
                     break
-                await asyncio.sleep(interval)
+                await asyncio.sleep(base)
         except asyncio.CancelledError:
             pass
 
@@ -369,10 +411,8 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
         else:
             await cycle_loop()
     finally:
-        if llm_client is not None:
-            await llm_client.aclose()
-        if data_client is not None:
-            await data_client.aclose()
+        for c in closers:
+            await c.aclose()
         if tg is not None:
             await tg.aclose()
         await executor.aclose()
@@ -409,7 +449,8 @@ def main() -> None:
     whale.add_argument("--dry-run", action="store_true")
 
     run = sub.add_parser("run", help="Run the paper loop: resolve → mark → tick on an interval")
-    run.add_argument("--strategy", choices=["micro", "placeholder", "llm", "whale"], default="micro")
+    run.add_argument("--strategy", choices=["micro", "placeholder", "llm", "whale", "all"],
+                     default="micro", help="'all' runs every signal in one process, each on its own interval")
     run.add_argument("--top", type=int, default=30)
     run.add_argument("--interval", type=int, default=None, help="seconds between cycles")
     run.add_argument("--once", action="store_true", help="run a single cycle and exit")

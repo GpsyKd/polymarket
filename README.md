@@ -83,7 +83,7 @@ docker compose up -d      # запустить runner в фоне
 docker compose logs -f    # смотреть логи
 ```
 
-Леджер (SQLite) сохраняется в `./data` (том), переживает рестарты. Стратегию/интервал менять в `command:` в [docker-compose.yml](docker-compose.yml) (`--strategy micro|llm|whale`). Управление на ходу — через Telegram (`/status`, `/pause`, `/resume`).
+Леджер (SQLite) сохраняется в `./data` (том), переживает рестарты. Стратегию/интервал менять в `command:` в [docker-compose.yml](docker-compose.yml) (`--strategy micro|llm|whale|all`). **`--strategy all`** гоняет все сигналы в одном процессе (каждый на своём интервале, один Telegram-поллер, одна БД) — так их эджи оцениваются параллельно, а `report` разбит по стратегиям. Управление на ходу — через Telegram (`/status`, `/pause`, `/resume`).
 
 ## Live-исполнение (реальные деньги) ⚠️
 
