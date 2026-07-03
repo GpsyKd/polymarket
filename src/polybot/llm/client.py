@@ -6,6 +6,7 @@ xAI Live Search (`search_parameters`) are trivial passthroughs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -86,15 +87,27 @@ class LLMClient:
         }
         if live_search:
             body["search_parameters"] = {"mode": "auto"}
-        try:
-            r = await self._client.post("/chat/completions", json=body)
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-        except httpx.HTTPStatusError as e:
-            log.warning("LLM %s HTTP %s: %s", model, e.response.status_code, e.response.text[:200])
-            return None
-        except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
-            log.warning("LLM %s call failed: %s", model, e)
+
+        content = None
+        for attempt in range(3):
+            try:
+                r = await self._client.post("/chat/completions", json=body)
+                if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # back off on rate-limit / transient 5xx
+                    continue
+                r.raise_for_status()
+                content = r.json()["choices"][0]["message"]["content"]
+                break
+            except httpx.HTTPStatusError as e:
+                log.warning("LLM %s HTTP %s: %s", model, e.response.status_code, e.response.text[:200])
+                return None
+            except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                log.warning("LLM %s call failed: %s", model, e)
+                return None
+        if content is None:
             return None
         try:
             parsed = json.loads(content)

@@ -71,6 +71,8 @@ class Market(BaseModel):
     spread: float | None = None
     best_bid: float | None = Field(default=None, alias="bestBid")
     best_ask: float | None = Field(default=None, alias="bestAsk")
+    price_change_1h: float | None = Field(default=None, alias="oneHourPriceChange")
+    price_change_24h: float | None = Field(default=None, alias="oneDayPriceChange")
 
     neg_risk_market_id: str | None = Field(default=None, alias="negRiskMarketID")
     group_item_title: str | None = Field(default=None, alias="groupItemTitle")
@@ -78,6 +80,7 @@ class Market(BaseModel):
 
     @field_validator(
         "liquidity", "volume", "volume_24hr", "spread", "best_bid", "best_ask",
+        "price_change_1h", "price_change_24h",
         mode="before",
     )
     @classmethod

@@ -216,6 +216,7 @@ def _run_report() -> None:
     positions = store.all_positions()
     report = build_report(positions)
 
+    by_strategy = report.pop("by_strategy", None)
     resolution = report.pop("resolution", None)
     print(json.dumps(report, indent=2))
 
@@ -228,6 +229,17 @@ def _run_report() -> None:
             for row in calibration:
                 print(f"  {row['bucket']}  n={row['n']:>3}  "
                       f"pred={row['pred']:.3f}  actual={row['actual']:.3f}")
+
+    if by_strategy:
+        print("\nby strategy (which signal actually has edge):")
+        for name, m in by_strategy.items():
+            line = (f"  {name:<22} n={m['n_closed']:>3}  pnl=${m['pnl_usd']:>8.2f}  "
+                    f"roi={m['roi']:+.3f}  win={m['win_rate']:.2f}")
+            res = m.get("resolution")
+            if res:
+                line += (f"  | resolved={res['n']} brier={res['brier']} "
+                         f"vs {res['brier_baseline_market']} beats={res['beats_market']}")
+            print(line)
 
     open_ = [p for p in positions if p.status == "open"]
     if open_:

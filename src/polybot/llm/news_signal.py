@@ -98,6 +98,10 @@ class NewsLLMAnalyzer:
             "resolution_criteria": (market.description or "")[:1200],
             "current_yes_price": round(yes_price, 3),
             "days_to_resolve": round(_days_to_resolve(market, now), 1),
+            "volume_24h_usd": round(market.volume_24hr or 0.0),
+            "liquidity_usd": round(market.liquidity or 0.0),
+            "price_change_24h": market.price_change_24h,
+            "price_change_1h": market.price_change_1h,
         })
         data = await self.client.complete_json(
             DEEP_SYSTEM, user, self.deep_model, live_search=self.live_search

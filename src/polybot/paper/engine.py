@@ -123,9 +123,13 @@ class PaperEngine:
         return open_ids, remaining, group_exposure
 
     async def _effective_bankroll(self) -> float:
-        """Sizing bankroll: config value, clamped to the real USDC balance when live."""
+        """Sizing bankroll. Paper: starting bankroll compounded by realized PnL.
+        Live: the real USDC balance (which already reflects PnL)."""
         bal = await self.executor.usdc_balance()
-        return self.s.bankroll_usd if bal is None else min(self.s.bankroll_usd, bal)
+        if bal is not None:
+            return max(self.s.min_stake_usd, bal)
+        realized = self.store.realized_pnl_all(mode=self.executor.mode)
+        return max(self.s.min_stake_usd, self.s.bankroll_usd + realized)
 
     def _candidate_markets(self, screened, top_candidates: int) -> list[Market]:
         """Shuffle a pool `scan_pool_factor`× wider than the per-tick slice, so

@@ -203,6 +203,14 @@ class Storage:
         ).fetchone()
         return float(row["s"] or 0.0)
 
+    def realized_pnl_all(self, mode: str | None = None) -> float:
+        clause, params = self._mode_clause(mode)
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(pnl_usd), 0) AS s FROM positions WHERE status='closed'{clause}",
+            params,
+        ).fetchone()
+        return float(row["s"] or 0.0)
+
     def get_flag(self, key: str, default: bool = False) -> bool:
         row = self.conn.execute("SELECT value FROM flags WHERE key=?", (key,)).fetchone()
         return default if row is None else row["value"] == "1"

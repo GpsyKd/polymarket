@@ -247,6 +247,34 @@ def test_open_position_stores_horizon(tmp_path):
     store.close()
 
 
+def test_report_by_strategy_and_compounding(tmp_path):
+    store = Storage(str(tmp_path / "s.sqlite3"))
+    store.insert_position(Position(market_id="1", question="Q", side="YES", entry_price=0.5,
+                                   model_prob=0.7, edge=0.2, size_usd=5.0, shares=10.0,
+                                   ts_open=_now(), strategy="micro"))
+    store.insert_position(Position(market_id="2", question="Q", side="YES", entry_price=0.5,
+                                   model_prob=0.6, edge=0.1, size_usd=4.0, shares=8.0,
+                                   ts_open=_now(), strategy="whale-flow"))
+    store.close_position(1, 1.0, 5.0, "Yes", _now(), "resolution")   # micro won
+    store.close_position(2, 0.0, -4.0, "No", _now(), "resolution")   # whale lost
+
+    report = build_report(store.all_positions())
+    assert "by_strategy" in report
+    assert report["by_strategy"]["micro"]["pnl_usd"] == 5.0
+    assert report["by_strategy"]["whale-flow"]["pnl_usd"] == -4.0
+    assert report["by_strategy"]["micro"]["resolution"]["n"] == 1
+    assert store.realized_pnl_all() == 1.0  # 5 - 4 (compounds the bankroll)
+    store.close()
+
+
+def test_market_price_change():
+    m = Market.model_validate({
+        "id": "1", "question": "Q", "outcomes": ["Yes", "No"],
+        "oneDayPriceChange": "0.05", "oneHourPriceChange": -0.01,
+    })
+    assert m.price_change_24h == 0.05 and m.price_change_1h == -0.01
+
+
 def test_open_position_group_cap(tmp_path):
     import asyncio
 
