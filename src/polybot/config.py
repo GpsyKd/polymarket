@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     screen_max_spread: float = 0.08
     screen_price_low: float = 0.05
     screen_price_high: float = 0.95
+    # Candidate rotation: shuffle a pool of top_candidates * this factor each tick,
+    # so scans are not glued to the same handful of mega-markets.
+    scan_pool_factor: int = 3
 
     # --- Storage & paper engine ---
     db_path: str = "data/polybot.sqlite3"
@@ -54,10 +57,16 @@ class Settings(BaseSettings):
     micro_edge_scale: float = 0.06  # prob lean per unit signed imbalance
     micro_min_edge: float = 0.02  # flow trades use a lower edge floor than value bets
 
-    # --- Exits (mark-to-market) for short-horizon strategies ---
+    # --- Exits (mark-to-market) — apply ONLY to flow-horizon positions ---
     exit_take_profit: float = 0.03  # close when side price gains this much
     exit_stop_loss: float = 0.05  # close when side price drops this much
     exit_max_hold_hours: float = 48.0
+    # Flow entries pay ~the full spread round-trip, so their spread cap must be
+    # well below exit_stop_loss or positions stop out instantly.
+    flow_max_spread: float = 0.02
+    # Close positions whose market is closed but never reached a definitive
+    # 0/1 winner after this many hours past end_date (paper mode only).
+    stale_grace_hours: float = 48.0
 
     # --- Whale-flow strategy (Polymarket data-api) ---
     data_api_base_url: str = "https://data-api.polymarket.com"
@@ -66,6 +75,7 @@ class Settings(BaseSettings):
     whale_min_flow: float = 0.3  # ignore weaker net flow
     whale_min_edge: float = 0.03
     whale_trades_limit: int = 100
+    whale_max_age_minutes: float = 90.0  # ignore whale trades older than this (already priced in)
 
     # --- Execution (paper/live) ---
     clob_tick_size: float = 0.01
@@ -88,6 +98,7 @@ class Settings(BaseSettings):
     llm_max_deep: int = 6
     llm_min_confidence: float = 0.55
     llm_analysis_ttl_hours: float = 6.0  # skip re-analyzing a market seen within this window
+    llm_interval_seconds: int = 1800  # default loop interval for the LLM strategy (news is slow)
 
     # --- Telegram (control + notifications) ---
     telegram_bot_token: str | None = None  # or env TELEGRAM_BOT_TOKEN

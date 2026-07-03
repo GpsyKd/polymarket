@@ -107,11 +107,13 @@ def test_live_armed_places_orders():
         fake = _FakeClob()
         ex = LiveExecutor(_settings(live_confirm=LIVE_CONFIRM_SENTINEL, max_position_usd=15.0),
                           private_key="0xkey", client=fake)
+        # buy is a limit-FAK capped at price + clob_slippage (0.5 + 0.02 default)
         fill = _run(ex.buy("token123", 0.5, 5.0, 0.01))
-        assert fill is not None and fill.order_id == "mkt-1"
+        assert fill is not None and fill.order_id == "lim-1"
         kind, args, _ = fake.orders[0]
-        assert kind == "market" and args.token_id == "token123" and args.side == "BUY"
-        assert abs(args.amount - 5.0) < 1e-9
+        assert kind == "limit" and args.token_id == "token123" and args.side == "BUY"
+        assert abs(args.price - 0.52) < 1e-9
+        assert abs(args.size - round(5.0 / 0.52, 2)) < 1e-9
 
         sell = _run(ex.sell("token123", 0.6, 8.0, 0.01))
         assert sell is not None and sell.order_id == "lim-1"
@@ -119,3 +121,30 @@ def test_live_armed_places_orders():
         assert kind2 == "limit" and args2.side == "SELL" and abs(args2.price - 0.6) < 1e-9
     finally:
         sys.modules.pop("py_clob_client_v2", None)
+
+
+def test_live_fill_parsing():
+    ex = LiveExecutor(_settings(live_confirm=LIVE_CONFIRM_SENTINEL), private_key="0xkey", client=object())
+
+    # explicit failure / unmatched FAK → no fill (position must NOT be recorded/closed)
+    assert ex._fill_from_response({"success": False}, side="BUY", price=0.5, shares=10, size_usd=5) is None
+    assert ex._fill_from_response({"status": "unmatched"}, side="SELL", price=0.5, shares=10, size_usd=5) is None
+
+    # matched with real amounts → ledger gets the actual fill, not the request
+    buy = ex._fill_from_response(
+        {"success": True, "status": "matched", "orderID": "o1",
+         "makingAmount": "4.0", "takingAmount": "8.0"},
+        side="BUY", price=0.5, shares=10.0, size_usd=5.0,
+    )
+    assert buy is not None and buy.size_usd == 4.0 and buy.shares == 8.0
+    assert abs(buy.price - 0.5) < 1e-9 and buy.order_id == "o1"
+
+    sell = ex._fill_from_response(
+        {"status": "matched", "makingAmount": "8.0", "takingAmount": "4.8"},
+        side="SELL", price=0.6, shares=8.0, size_usd=4.8,
+    )
+    assert sell is not None and sell.shares == 8.0 and abs(sell.price - 0.6) < 1e-9
+
+    # matched but amounts missing → conservative fallback to the request
+    fb = ex._fill_from_response({"orderID": "o2"}, side="BUY", price=0.5, shares=10.0, size_usd=5.0)
+    assert fb is not None and fb.shares == 10.0 and fb.order_id == "o2"

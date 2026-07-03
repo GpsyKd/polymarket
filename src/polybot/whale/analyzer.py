@@ -10,6 +10,7 @@ ledger measures.
 from __future__ import annotations
 
 import logging
+import time
 
 from ..data.dataapi import PolymarketDataClient, Trade
 from ..data.models import Market
@@ -24,11 +25,18 @@ def whale_signal(
     min_whale_usd: float,
     edge_scale: float,
     min_flow: float,
+    min_ts: int = 0,
 ) -> Signal | None:
-    """Net large-trade flow → a small directional lean on P(YES), or None."""
+    """Net large-trade flow → a small directional lean on P(YES), or None.
+
+    Trades older than `min_ts` are ignored: a whale trade from days ago is
+    already reflected in the price and following it late has no edge.
+    """
     net = 0.0
     total = 0.0
     for t in trades:
+        if t.timestamp < min_ts:
+            continue
         usd = t.size * t.price
         if usd < min_whale_usd:
             continue
@@ -59,12 +67,14 @@ class WhaleAnalyzer:
         edge_scale: float = 0.08,
         min_flow: float = 0.3,
         trades_limit: int = 100,
+        max_age_minutes: float = 90.0,
     ) -> None:
         self.data_client = data_client
         self.min_whale_usd = min_whale_usd
         self.edge_scale = edge_scale
         self.min_flow = min_flow
         self.trades_limit = trades_limit
+        self.max_age_minutes = max_age_minutes
 
     async def analyze(self, market: Market, yes_price: float) -> Signal | None:
         if not market.condition_id:
@@ -74,4 +84,7 @@ class WhaleAnalyzer:
         except Exception as e:  # noqa: BLE001
             log.debug("trades fetch failed for %s: %s", market.condition_id, e)
             return None
-        return whale_signal(trades, yes_price, self.min_whale_usd, self.edge_scale, self.min_flow)
+        min_ts = int(time.time() - self.max_age_minutes * 60.0)
+        return whale_signal(
+            trades, yes_price, self.min_whale_usd, self.edge_scale, self.min_flow, min_ts=min_ts
+        )

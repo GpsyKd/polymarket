@@ -89,8 +89,14 @@ def _make_llm_client() -> LLMClient | None:
 
 def _make_analyzer(client: LLMClient) -> NewsLLMAnalyzer:
     s = get_settings()
-    return NewsLLMAnalyzer(
-        client, s.llm_triage_model, s.llm_deep_model, s.llm_live_search, s.llm_min_confidence
+    return NewsLLMAnalyzer(client, s.llm_triage_model, s.llm_deep_model, s.llm_live_search)
+
+
+def _make_whale_analyzer(dc: PolymarketDataClient) -> WhaleAnalyzer:
+    s = get_settings()
+    return WhaleAnalyzer(
+        dc, s.whale_min_usd, s.whale_edge_scale, s.whale_min_flow,
+        s.whale_trades_limit, s.whale_max_age_minutes,
     )
 
 
@@ -155,10 +161,7 @@ async def _run_whale_tick(top: int, min_edge: float | None, dry_run: bool) -> No
     store = Storage(settings.db_path)
     edge = settings.whale_min_edge if min_edge is None else min_edge
     async with PolymarketDataClient(settings.data_api_base_url, settings.http_timeout) as dc:
-        analyzer = WhaleAnalyzer(
-            dc, settings.whale_min_usd, settings.whale_edge_scale,
-            settings.whale_min_flow, settings.whale_trades_limit,
-        )
+        analyzer = _make_whale_analyzer(dc)
         engine = PaperEngine(settings, store)
         opened = await engine.whale_tick(analyzer, top_candidates=top, min_edge=edge, dry_run=dry_run)
     log.info("whale-tick opened %d position(s)%s", len(opened), " [dry-run]" if dry_run else "")
@@ -249,7 +252,9 @@ async def _run_balance() -> None:
 async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, min_edge: float | None) -> None:
     settings = get_settings()
     store = Storage(settings.db_path)
-    interval = settings.runner_interval_seconds if interval is None else interval
+    if interval is None:
+        # News moves on minutes-to-hours; ticking the LLM funnel every 5 min just burns API budget.
+        interval = settings.llm_interval_seconds if strategy == "llm" else settings.runner_interval_seconds
     executor = _build_executor(settings)
     llm_client: LLMClient | None = None
     data_client: PolymarketDataClient | None = None
@@ -268,10 +273,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
             return await engine.llm_tick(analyzer, top_candidates=top, min_edge=edge)
     elif strategy == "whale":
         data_client = PolymarketDataClient(settings.data_api_base_url, settings.http_timeout)
-        analyzer = WhaleAnalyzer(
-            data_client, settings.whale_min_usd, settings.whale_edge_scale,
-            settings.whale_min_flow, settings.whale_trades_limit,
-        )
+        analyzer = _make_whale_analyzer(data_client)
         engine = PaperEngine(settings, store, executor=executor)
         edge = settings.whale_min_edge if min_edge is None else min_edge
         strat_name = analyzer.name
@@ -287,7 +289,7 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
         async def do_tick():
             return await engine.tick(top_candidates=top, min_edge=edge)
 
-    control = ControlState()
+    control = ControlState.load(store)  # /pause survives restarts
     tg_token, tg_chat = resolve_bot_token(settings), resolve_chat_id(settings)
     tg = TelegramClient(tg_token) if (tg_token and tg_chat and not once) else None
 
@@ -295,39 +297,54 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
         if tg:
             await tg.send_message(tg_chat, text)
 
-    log.info("runner start: strategy=%s mode=%s edge=%.3f interval=%ss%s telegram=%s",
-             strat_name, executor.mode, edge, interval, " [once]" if once else "", bool(tg))
+    log.info("runner start: strategy=%s mode=%s edge=%.3f interval=%ss%s telegram=%s paused=%s",
+             strat_name, executor.mode, edge, interval, " [once]" if once else "", bool(tg),
+             control.paused)
 
     async def cycle_loop() -> None:
         cycle = 0
-        await notify(f"▶️ polybot started — {strat_name}, mode={executor.mode}, every {interval}s")
+        kill_active = False
+        await notify(f"▶️ polybot started — {strat_name}, mode={executor.mode}, every {interval}s"
+                     + (" [paused]" if control.paused else ""))
         try:
             while True:
                 cycle += 1
-                resolved = await engine.resolve()
-                exited = await engine.mark_and_exit()
+                # One flaky network call must not take the 24/7 runner down.
+                try:
+                    resolved = await engine.resolve()
+                    exited = await engine.mark_and_exit()
 
-                day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-                day_pnl = store.realized_pnl_since(day_ago)
-                if control.paused:
-                    opened = []
-                elif day_pnl <= -settings.daily_loss_limit_usd:
-                    log.warning("KILL-SWITCH: 24h PnL $%.2f <= -$%.2f — no new opens",
-                                day_pnl, settings.daily_loss_limit_usd)
-                    opened = []
-                    await notify(f"🛑 kill-switch: 24h PnL ${day_pnl:.2f} — opens halted")
-                else:
-                    opened = await do_tick()
+                    day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+                    day_pnl = store.realized_pnl_since(day_ago, mode=executor.mode)
+                    if control.paused:
+                        opened = []
+                    elif day_pnl <= -settings.daily_loss_limit_usd:
+                        opened = []
+                        log.warning("KILL-SWITCH: 24h PnL $%.2f <= -$%.2f — no new opens",
+                                    day_pnl, settings.daily_loss_limit_usd)
+                        if not kill_active:  # notify on transition only, not every cycle
+                            kill_active = True
+                            await notify(f"🛑 kill-switch: 24h PnL ${day_pnl:.2f} — opens halted")
+                    else:
+                        if kill_active:
+                            kill_active = False
+                            await notify("✅ kill-switch cleared — opens resumed")
+                        opened = await do_tick()
 
-                log.info(
-                    "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f "
-                    "| 24h_pnl=$%.2f%s",
-                    cycle, len(resolved), len(exited), len(opened),
-                    len(store.open_positions()), store.open_exposure(), day_pnl,
-                    " [paused]" if control.paused else "",
-                )
-                if tg and (opened or exited or resolved):
-                    await notify(_cycle_message(resolved, exited, opened))
+                    log.info(
+                        "cycle %d: resolved %d | exited %d | opened %d | open=%d exposure=$%.2f "
+                        "| 24h_pnl=$%.2f%s",
+                        cycle, len(resolved), len(exited), len(opened),
+                        len(store.open_positions(mode=executor.mode)),
+                        store.open_exposure(mode=executor.mode), day_pnl,
+                        " [paused]" if control.paused else "",
+                    )
+                    if tg and (opened or exited or resolved):
+                        await notify(_cycle_message(resolved, exited, opened))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    log.exception("cycle %d failed; retrying next interval", cycle)
                 if once:
                     break
                 await asyncio.sleep(interval)

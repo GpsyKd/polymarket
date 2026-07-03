@@ -2,17 +2,21 @@
 
 Positions leave the book two ways:
   * resolve()        — the market settled; pay 1/0 on the winning outcome.
-  * mark_and_exit()  — short-horizon (flow) exit at the current mid on
-                        take-profit / stop-loss / max-hold.
+  * mark_and_exit()  — flow-horizon positions ONLY: exit at the current mid on
+                        take-profit / stop-loss / max-hold. Resolution-horizon
+                        positions (LLM/whale value bets) are held to settlement
+                        so the Brier/calibration gate gets real data.
 
 Positions are opened by tick() (a per-market Strategy), llm_tick() (the news+LLM
 funnel), or whale_tick() (large-trade flow); all share _open_position() for
-sizing, risk caps, and execution.
+sizing, risk caps, and execution. All storage reads/writes are scoped to the
+executor's mode so paper and live ledgers never interact.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 
 from ..config import Settings
@@ -112,10 +116,29 @@ class PaperEngine:
         self.executor: Executor = executor or PaperExecutor()
 
     def _load_state(self) -> tuple[set[str], float, dict[str, float]]:
-        open_ids = self.store.open_market_ids()
-        remaining = self.s.max_total_exposure_usd - self.store.open_exposure()
-        group_exposure = self.store.exposure_by_group()
+        mode = self.executor.mode
+        open_ids = self.store.open_market_ids(mode=mode)
+        remaining = self.s.max_total_exposure_usd - self.store.open_exposure(mode=mode)
+        group_exposure = self.store.exposure_by_group(mode=mode)
         return open_ids, remaining, group_exposure
+
+    async def _effective_bankroll(self) -> float:
+        """Sizing bankroll: config value, clamped to the real USDC balance when live."""
+        bal = await self.executor.usdc_balance()
+        return self.s.bankroll_usd if bal is None else min(self.s.bankroll_usd, bal)
+
+    def _candidate_markets(self, screened, top_candidates: int) -> list[Market]:
+        """Shuffle a pool `scan_pool_factor`× wider than the per-tick slice, so
+        successive ticks rotate through mid-tier markets instead of re-scanning
+        the same top-liquidity handful (where prices are most efficient)."""
+        pool = [r.market for r in screened[: top_candidates * max(1, self.s.scan_pool_factor)]]
+        random.shuffle(pool)
+        return pool[:top_candidates]
+
+    def _max_spread(self, horizon: str) -> float:
+        """Flow trades pay ~the full spread round-trip; cap it well below the
+        stop-loss or positions would stop out on entry costs alone."""
+        return self.s.flow_max_spread if horizon == "flow" else self.s.screen_max_spread
 
     def _group_full(self, market: Market, group_exposure: dict[str, float]) -> bool:
         left = self.s.max_exposure_per_group_usd - group_exposure.get(market.group_key(), 0.0)
@@ -134,6 +157,8 @@ class PaperEngine:
         *,
         strategy_name: str,
         rationale: str,
+        horizon: str = "resolution",
+        bankroll: float | None = None,
     ) -> tuple[Position | None, float]:
         s = self.s
         gkey = market.group_key()
@@ -145,7 +170,7 @@ class PaperEngine:
         bet = decide_bet(
             prob_yes,
             yes_price,
-            bankroll=s.bankroll_usd,
+            bankroll=s.bankroll_usd if bankroll is None else bankroll,
             min_edge=edge_floor,
             kelly_mult=s.kelly_fraction,
             max_position=s.max_position_usd,
@@ -154,6 +179,10 @@ class PaperEngine:
             fee=half_spread,
         )
         if bet is None:
+            return None, 0.0
+        if book and book.min_order_size and bet.shares < book.min_order_size:
+            log.debug("skip %s: %.2f sh below CLOB min order size %.2f",
+                      market.id, bet.shares, book.min_order_size)
             return None, 0.0
 
         token_id = _token_for_side(market, bet.side)
@@ -182,6 +211,7 @@ class PaperEngine:
             rationale=rationale,
             group_key=gkey,
             mode=self.executor.mode,
+            horizon=horizon,
         )
         if not dry_run:
             pos.id = self.store.insert_position(pos)
@@ -211,14 +241,16 @@ class PaperEngine:
         screened = screen_markets(markets, s)
         log.info("screened %d / %d markets", len(screened), len(markets))
 
+        horizon = getattr(self.strategy, "horizon", "resolution")
+        max_spread = self._max_spread(horizon)
         open_ids, remaining, group_exposure = self._load_state()
+        bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 
         async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
-            for r in screened[:top_candidates]:
+            for m in self._candidate_markets(screened, top_candidates):
                 if len(opened) >= s.max_new_positions_per_tick or remaining < s.min_stake_usd:
                     break
-                m = r.market
                 if m.id in open_ids or self._group_full(m, group_exposure):
                     continue
 
@@ -226,7 +258,7 @@ class PaperEngine:
                 yes_price = book.mid if (book and book.mid is not None) else m.yes_price()
                 if yes_price is None or not (0.0 < yes_price < 1.0):
                     continue
-                if book and book.spread is not None and book.spread > s.screen_max_spread:
+                if book and book.spread is not None and book.spread > max_spread:
                     continue
 
                 signal = self.strategy.evaluate(m, yes_price, book)
@@ -236,6 +268,7 @@ class PaperEngine:
                 pos, used = await self._open_position(
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=self.strategy.name, rationale=signal.rationale,
+                    horizon=horizon, bankroll=bankroll,
                 )
                 if pos is None:
                     continue
@@ -254,19 +287,25 @@ class PaperEngine:
         async with GammaClient(s.gamma_base_url, s.http_timeout) as gamma:
             markets = await gamma.fetch_markets(max_markets=2000)
         screened = screen_markets(markets, s)
-        candidates = [r.market for r in screened[: max(top_candidates, s.llm_triage_batch)]][: s.llm_triage_batch]
+        batch = min(top_candidates, s.llm_triage_batch)
+        pool = [r.market for r in screened[: batch * max(1, s.scan_pool_factor)]]
 
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=s.llm_analysis_ttl_hours)).isoformat()
         recent = self.store.recently_analyzed_ids(cutoff)
-        before = len(candidates)
-        candidates = [m for m in candidates if m.id not in recent]
-        skipped = before - len(candidates)
+        before = len(pool)
+        pool = [m for m in pool if m.id not in recent]
+        skipped = before - len(pool)
+        random.shuffle(pool)
+        candidates = pool[:batch]
 
         selected = await analyzer.triage(candidates, s.llm_max_deep)
         log.info("llm triage: %d fresh candidates -> %d selected (%d skipped, analyzed <%.0fh ago)",
                  len(candidates), len(selected), skipped, s.llm_analysis_ttl_hours)
 
+        horizon = getattr(analyzer, "horizon", "resolution")
+        max_spread = self._max_spread(horizon)
         open_ids, remaining, group_exposure = self._load_state()
+        bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 
         async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
@@ -280,20 +319,23 @@ class PaperEngine:
                 yes_price = book.mid if (book and book.mid is not None) else m.yes_price()
                 if yes_price is None or not (0.0 < yes_price < 1.0):
                     continue
-                if book and book.spread is not None and book.spread > s.screen_max_spread:
+                if book and book.spread is not None and book.spread > max_spread:
                     continue
 
                 signal = await analyzer.deep_analyze(m, yes_price)
+                # Record every completed analysis (even low-confidence ones), or the
+                # TTL dedup never sees the market and we pay for it again next tick.
                 if signal is not None and not dry_run:
                     self.store.record_analysis(
                         m.id, signal.prob_yes, signal.confidence, analyzer.deep_model, _now_iso()
                     )
-                if signal is None:
+                if signal is None or signal.confidence < s.llm_min_confidence:
                     continue
 
                 pos, used = await self._open_position(
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
+                    horizon=horizon, bankroll=bankroll,
                 )
                 if pos is None:
                     continue
@@ -314,14 +356,16 @@ class PaperEngine:
         screened = screen_markets(markets, s)
         log.info("whale: scanning up to %d candidates", min(top_candidates, len(screened)))
 
+        horizon = getattr(analyzer, "horizon", "resolution")
+        max_spread = self._max_spread(horizon)
         open_ids, remaining, group_exposure = self._load_state()
+        bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 
         async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
-            for r in screened[:top_candidates]:
+            for m in self._candidate_markets(screened, top_candidates):
                 if len(opened) >= s.max_new_positions_per_tick or remaining < s.min_stake_usd:
                     break
-                m = r.market
                 if m.id in open_ids or self._group_full(m, group_exposure) or not m.condition_id:
                     continue
 
@@ -329,7 +373,7 @@ class PaperEngine:
                 yes_price = book.mid if (book and book.mid is not None) else m.yes_price()
                 if yes_price is None or not (0.0 < yes_price < 1.0):
                     continue
-                if book and book.spread is not None and book.spread > s.screen_max_spread:
+                if book and book.spread is not None and book.spread > max_spread:
                     continue
 
                 signal = await analyzer.analyze(m, yes_price)
@@ -339,6 +383,7 @@ class PaperEngine:
                 pos, used = await self._open_position(
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
+                    horizon=horizon, bankroll=bankroll,
                 )
                 if pos is None:
                     continue
@@ -348,15 +393,46 @@ class PaperEngine:
 
         return opened
 
+    def _close_stale(self, p: Position, market: Market, now: datetime) -> float | None:
+        """Paper-only fallback: a market can sit closed without ever showing a
+        definitive 0/1 winner (delisted, disputed, ambiguous prices). After a
+        grace period past end_date, close at the held side's last price so the
+        position stops eating exposure forever. Live redemption is manual."""
+        if self.executor.mode != "paper" or not market.closed:
+            return None
+        end = market.end_date
+        if end is None:
+            return None
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if (now - end).total_seconds() < self.s.stale_grace_hours * 3600.0:
+            return None
+        idx = 0 if p.side == "YES" else 1
+        prices = market.outcome_prices
+        if len(prices) <= idx:
+            return None
+        exit_price = min(max(prices[idx], 0.0), 1.0)
+        pnl = p.shares * exit_price - p.size_usd
+        if p.id is not None:
+            self.store.close_position(p.id, exit_price, pnl, "stale", _now_iso(), "closed_unresolved")
+        log.warning("stale-closed #%s %s @%.3f pnl $%.2f — closed market never resolved cleanly: %s",
+                    p.id, p.side, exit_price, pnl, p.question[:60])
+        return pnl
+
     async def resolve(self) -> list[tuple[Position, float]]:
+        now = datetime.now(timezone.utc)
         closed: list[tuple[Position, float]] = []
         async with GammaClient(self.s.gamma_base_url, self.s.http_timeout) as gamma:
-            for p in self.store.open_positions():
+            for p in self.store.open_positions(mode=self.executor.mode):
                 market = await gamma.get_market(p.market_id)
                 if market is None:
+                    log.warning("resolve: market %s not found; position #%s stays open", p.market_id, p.id)
                     continue
                 winner = winner_label(market)
                 if winner is None:
+                    stale_pnl = self._close_stale(p, market, now)
+                    if stale_pnl is not None:
+                        closed.append((p, stale_pnl))
                     continue
                 exit_price, pnl, _ = settle(p.side, p.shares, p.size_usd, winner, market.outcomes)
                 if p.id is not None:
@@ -369,8 +445,10 @@ class PaperEngine:
         now = datetime.now(timezone.utc)
         closed: list[tuple[Position, float, str]] = []
         async with ClobClient(s.clob_base_url, s.http_timeout) as clob:
-            for p in self.store.open_positions():
-                if not p.token_id:
+            for p in self.store.open_positions(mode=self.executor.mode):
+                # Value bets (resolution horizon) are held to settlement — TP/SL
+                # here would cut their edge short and starve the Brier gate.
+                if p.horizon != "flow" or not p.token_id:
                     continue
                 try:
                     book = await clob.fetch_book(p.token_id)

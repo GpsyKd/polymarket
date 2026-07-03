@@ -28,9 +28,15 @@ CREATE TABLE IF NOT EXISTS positions (
     pnl_usd REAL,
     outcome TEXT,
     close_reason TEXT,
-    mode TEXT NOT NULL DEFAULT 'paper'
+    mode TEXT NOT NULL DEFAULT 'paper',
+    horizon TEXT NOT NULL DEFAULT 'resolution'
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+
+CREATE TABLE IF NOT EXISTS flags (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS analysis_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_analysis_ts ON analysis_log(ts);
 _COLS = [
     "ts_open", "market_id", "token_id", "question", "side", "entry_price",
     "model_prob", "edge", "size_usd", "shares", "status", "strategy",
-    "rationale", "group_key", "mode",
+    "rationale", "group_key", "mode", "horizon",
 ]
 
 
@@ -74,6 +80,7 @@ class Position:
     outcome: str | None = None
     close_reason: str | None = None
     mode: str = "paper"
+    horizon: str = "resolution"  # "resolution" (hold to settle) | "flow" (TP/SL/max-hold)
     id: int | None = None
 
 
@@ -91,7 +98,11 @@ class Storage:
     def _migrate(self) -> None:
         """Add columns introduced after a DB was first created."""
         existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
-        for col, ddl in (("close_reason", "close_reason TEXT"), ("group_key", "group_key TEXT")):
+        for col, ddl in (
+            ("close_reason", "close_reason TEXT"),
+            ("group_key", "group_key TEXT"),
+            ("horizon", "horizon TEXT NOT NULL DEFAULT 'resolution'"),
+        ):
             if col not in existing:
                 self.conn.execute(f"ALTER TABLE positions ADD COLUMN {ddl}")
 
@@ -109,30 +120,44 @@ class Storage:
     def _row_to_pos(row: sqlite3.Row) -> Position:
         return Position(**{k: row[k] for k in row.keys()})
 
-    def open_positions(self) -> list[Position]:
-        rows = self.conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+    @staticmethod
+    def _mode_clause(mode: str | None) -> tuple[str, list]:
+        """Paper and live positions never mix: exposure, exits and settlement are
+        computed per execution mode so a paper history can't drive live orders."""
+        return ("", []) if mode is None else (" AND mode=?", [mode])
+
+    def open_positions(self, mode: str | None = None) -> list[Position]:
+        clause, params = self._mode_clause(mode)
+        rows = self.conn.execute(
+            f"SELECT * FROM positions WHERE status='open'{clause}", params
+        ).fetchall()
         return [self._row_to_pos(r) for r in rows]
 
     def all_positions(self) -> list[Position]:
         rows = self.conn.execute("SELECT * FROM positions ORDER BY id").fetchall()
         return [self._row_to_pos(r) for r in rows]
 
-    def open_market_ids(self) -> set[str]:
+    def open_market_ids(self, mode: str | None = None) -> set[str]:
+        clause, params = self._mode_clause(mode)
         rows = self.conn.execute(
-            "SELECT DISTINCT market_id FROM positions WHERE status='open'"
+            f"SELECT DISTINCT market_id FROM positions WHERE status='open'{clause}", params
         ).fetchall()
         return {r["market_id"] for r in rows}
 
-    def open_exposure(self) -> float:
+    def open_exposure(self, mode: str | None = None) -> float:
+        clause, params = self._mode_clause(mode)
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(size_usd), 0) AS s FROM positions WHERE status='open'"
+            f"SELECT COALESCE(SUM(size_usd), 0) AS s FROM positions WHERE status='open'{clause}",
+            params,
         ).fetchone()
         return float(row["s"] or 0.0)
 
-    def exposure_by_group(self) -> dict[str, float]:
+    def exposure_by_group(self, mode: str | None = None) -> dict[str, float]:
+        clause, params = self._mode_clause(mode)
         rows = self.conn.execute(
             "SELECT group_key, COALESCE(SUM(size_usd), 0) AS s FROM positions "
-            "WHERE status='open' AND group_key IS NOT NULL GROUP BY group_key"
+            f"WHERE status='open' AND group_key IS NOT NULL{clause} GROUP BY group_key",
+            params,
         ).fetchall()
         return {r["group_key"]: float(r["s"] or 0.0) for r in rows}
 
@@ -169,13 +194,26 @@ class Storage:
         ).fetchall()
         return {r["market_id"] for r in rows}
 
-    def realized_pnl_since(self, since_iso: str) -> float:
+    def realized_pnl_since(self, since_iso: str, mode: str | None = None) -> float:
+        clause, params = self._mode_clause(mode)
         row = self.conn.execute(
             "SELECT COALESCE(SUM(pnl_usd), 0) AS s FROM positions "
-            "WHERE status='closed' AND ts_close >= ?",
-            (since_iso,),
+            f"WHERE status='closed' AND ts_close >= ?{clause}",
+            [since_iso, *params],
         ).fetchone()
         return float(row["s"] or 0.0)
+
+    def get_flag(self, key: str, default: bool = False) -> bool:
+        row = self.conn.execute("SELECT value FROM flags WHERE key=?", (key,)).fetchone()
+        return default if row is None else row["value"] == "1"
+
+    def set_flag(self, key: str, value: bool) -> None:
+        self.conn.execute(
+            "INSERT INTO flags (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, "1" if value else "0"),
+        )
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()

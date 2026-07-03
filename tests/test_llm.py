@@ -39,7 +39,7 @@ def test_extract_json():
 def test_triage_selects_subset():
     markets = [_market("1"), _market("2"), _market("3")]
     fc = FakeClient([{"selected": ["2", "3"]}])
-    analyzer = NewsLLMAnalyzer(fc, "triageM", "deepM", live_search=True, min_confidence=0.5)
+    analyzer = NewsLLMAnalyzer(fc, "triageM", "deepM", live_search=True)
     selected = _run(analyzer.triage(markets, limit=5))
     assert [m.id for m in selected] == ["2", "3"]
     assert fc.calls[0][0] == "triageM"
@@ -52,18 +52,20 @@ def test_triage_empty_on_no_response():
 
 def test_deep_analyze():
     ok = NewsLLMAnalyzer(FakeClient([{"prob_yes": 0.7, "confidence": 0.8, "rationale": "x"}]),
-                         "t", "deepM", live_search=True, min_confidence=0.55)
+                         "t", "deepM", live_search=True)
     sig = _run(ok.deep_analyze(_market("1"), 0.4))
     assert sig is not None and abs(sig.prob_yes - 0.7) < 1e-9 and sig.confidence == 0.8
 
-    low = NewsLLMAnalyzer(FakeClient([{"prob_yes": 0.7, "confidence": 0.3}]), "t", "d", min_confidence=0.55)
-    assert _run(low.deep_analyze(_market("1"), 0.4)) is None
+    # low confidence still yields a Signal — the engine records it and gates itself
+    low = NewsLLMAnalyzer(FakeClient([{"prob_yes": 0.7, "confidence": 0.3}]), "t", "d")
+    low_sig = _run(low.deep_analyze(_market("1"), 0.4))
+    assert low_sig is not None and low_sig.confidence == 0.3
 
-    none = NewsLLMAnalyzer(FakeClient([None]), "t", "d", min_confidence=0.55)
+    none = NewsLLMAnalyzer(FakeClient([None]), "t", "d")
     assert _run(none.deep_analyze(_market("1"), 0.4)) is None
 
     # prob is clamped, deep model + live_search are used
     fc = FakeClient([{"prob_yes": 1.5, "confidence": 0.9}])
-    clamp = NewsLLMAnalyzer(fc, "t", "deepM", live_search=True, min_confidence=0.5)
+    clamp = NewsLLMAnalyzer(fc, "t", "deepM", live_search=True)
     sig2 = _run(clamp.deep_analyze(_market("1"), 0.4))
     assert sig2 is not None and sig2.prob_yes == 0.99 and fc.calls[0] == ("deepM", True)

@@ -183,6 +183,70 @@ def test_realized_pnl_since(tmp_path):
     store.close()
 
 
+def test_storage_mode_isolation(tmp_path):
+    store = Storage(str(tmp_path / "m.sqlite3"))
+    store.insert_position(Position(market_id="1", question="Q", side="YES", entry_price=0.5,
+                                   model_prob=0.6, edge=0.1, size_usd=5.0, shares=10.0,
+                                   ts_open=_now(), mode="paper"))
+    store.insert_position(Position(market_id="2", question="Q", side="YES", entry_price=0.5,
+                                   model_prob=0.6, edge=0.1, size_usd=7.0, shares=14.0,
+                                   ts_open=_now(), mode="live"))
+    assert store.open_exposure(mode="paper") == 5.0
+    assert store.open_exposure(mode="live") == 7.0
+    assert store.open_exposure() == 12.0  # unfiltered view still available
+    assert store.open_market_ids(mode="live") == {"2"}
+    assert [p.market_id for p in store.open_positions(mode="paper")] == ["1"]
+    store.close()
+
+
+def test_storage_flags(tmp_path):
+    store = Storage(str(tmp_path / "f.sqlite3"))
+    assert store.get_flag("paused") is False
+    store.set_flag("paused", True)
+    assert store.get_flag("paused") is True
+    store.set_flag("paused", False)
+    assert store.get_flag("paused") is False
+    store.close()
+
+
+def test_mark_and_exit_skips_resolution_horizon(tmp_path):
+    """Value bets (horizon='resolution') must never be TP/SL-exited —
+    they are held to settlement so the Brier gate gets data."""
+    import asyncio
+
+    from polybot.config import Settings
+    from polybot.paper.engine import PaperEngine
+
+    store = Storage(str(tmp_path / "h.sqlite3"))
+    store.insert_position(Position(
+        market_id="1", token_id="tok1", question="Q", side="YES", entry_price=0.5,
+        model_prob=0.6, edge=0.1, size_usd=5.0, shares=10.0, ts_open=_now(),
+        horizon="resolution",
+    ))
+    engine = PaperEngine(Settings(), store)
+    closed = asyncio.run(engine.mark_and_exit())  # no flow positions → no network calls
+    assert closed == []
+    assert len(store.open_positions()) == 1
+    store.close()
+
+
+def test_open_position_stores_horizon(tmp_path):
+    import asyncio
+
+    from polybot.config import Settings
+    from polybot.paper.engine import PaperEngine
+
+    store = Storage(str(tmp_path / "hz.sqlite3"))
+    engine = PaperEngine(Settings(), store)
+    pos, _ = asyncio.run(engine._open_position(
+        _market(clobTokenIds='["t0","t1"]'), 0.5, None, 0.7, 0.05, 100.0, {},
+        dry_run=False, strategy_name="t", rationale="r", horizon="flow",
+    ))
+    assert pos is not None and pos.horizon == "flow"
+    assert store.open_positions()[0].horizon == "flow"
+    store.close()
+
+
 def test_open_position_group_cap(tmp_path):
     import asyncio
 

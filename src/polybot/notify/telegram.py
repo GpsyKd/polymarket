@@ -34,7 +34,19 @@ HELP = (
 
 @dataclass
 class ControlState:
+    """Pause flag, persisted via Storage so /pause survives a restart/crash."""
+
     paused: bool = False
+    store: Storage | None = None
+
+    @classmethod
+    def load(cls, store: Storage) -> "ControlState":
+        return cls(paused=store.get_flag("paused"), store=store)
+
+    def set_paused(self, value: bool) -> None:
+        self.paused = value
+        if self.store is not None:
+            self.store.set_flag("paused", value)
 
 
 def resolve_bot_token(settings: Any) -> str | None:
@@ -83,10 +95,10 @@ def handle_command(text: str, control: ControlState, store: Storage) -> str | No
     if cmd in ("/start", "/help"):
         return HELP
     if cmd == "/pause":
-        control.paused = True
+        control.set_paused(True)
         return "⏸ Paused — no new positions will be opened until /resume."
     if cmd == "/resume":
-        control.paused = False
+        control.set_paused(False)
         return "▶️ Resumed — opening new positions again."
     if cmd == "/status":
         day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()

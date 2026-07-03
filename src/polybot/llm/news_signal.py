@@ -59,13 +59,11 @@ class NewsLLMAnalyzer:
         triage_model: str,
         deep_model: str,
         live_search: bool = True,
-        min_confidence: float = 0.55,
     ) -> None:
         self.client = client
         self.triage_model = triage_model
         self.deep_model = deep_model
         self.live_search = live_search
-        self.min_confidence = min_confidence
 
     async def triage(self, markets: list[Market], limit: int) -> list[Market]:
         if not markets:
@@ -91,6 +89,9 @@ class NewsLLMAnalyzer:
         return [m for m in markets if m.id in chosen_ids][:limit]
 
     async def deep_analyze(self, market: Market, yes_price: float) -> Signal | None:
+        """Returns a Signal for every successfully parsed analysis, including
+        low-confidence ones — the engine records it (for TTL dedup / research)
+        and applies the confidence gate itself. None only on API/parse failure."""
         now = datetime.now(timezone.utc)
         user = json.dumps({
             "question": market.question,
@@ -107,8 +108,6 @@ class NewsLLMAnalyzer:
             prob = min(max(float(data["prob_yes"]), 0.01), 0.99)
             confidence = float(data.get("confidence") or 0.0)
         except (TypeError, ValueError):
-            return None
-        if confidence < self.min_confidence:
             return None
         rationale = str(data.get("rationale") or "")[:200]
         return Signal(prob_yes=prob, confidence=confidence, rationale=f"llm({confidence:.2f}): {rationale}")

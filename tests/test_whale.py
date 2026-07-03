@@ -6,8 +6,8 @@ from polybot.data.dataapi import Trade
 from polybot.whale.analyzer import whale_signal
 
 
-def _t(side: str, idx: int, size: float, price: float) -> Trade:
-    return Trade(wallet="w", side=side, outcome_index=idx, size=size, price=price, timestamp=0)
+def _t(side: str, idx: int, size: float, price: float, ts: int = 0) -> Trade:
+    return Trade(wallet="w", side=side, outcome_index=idx, size=size, price=price, timestamp=ts)
 
 
 def test_direction():
@@ -35,3 +35,15 @@ def test_flow_magnitude():
     sig = whale_signal([_t("BUY", 0, 2000, 0.5)], 0.5, 500, 0.08, 0.3)
     assert sig is not None and abs(sig.prob_yes - 0.58) < 1e-9
     assert "whale flow" in sig.rationale
+
+
+def test_stale_trades_ignored():
+    # whale trade from before min_ts is already priced in → no signal
+    old = [_t("BUY", 0, 2000, 0.5, ts=1_000)]
+    assert whale_signal(old, 0.5, 500, 0.08, 0.3, min_ts=2_000) is None
+    fresh = [_t("BUY", 0, 2000, 0.5, ts=3_000)]
+    assert whale_signal(fresh, 0.5, 500, 0.08, 0.3, min_ts=2_000) is not None
+    # mixed: only the fresh trade counts
+    mixed = [_t("BUY", 0, 2000, 0.5, ts=1_000), _t("SELL", 0, 2000, 0.5, ts=3_000)]
+    sig = whale_signal(mixed, 0.5, 500, 0.08, 0.3, min_ts=2_000)
+    assert sig is not None and sig.prob_yes < 0.5

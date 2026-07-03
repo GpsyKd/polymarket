@@ -72,19 +72,25 @@ class LiveExecutor:
         if size_usd > self.s.max_position_usd + 1e-6:
             log.error("LIVE buy blocked: $%.2f exceeds max_position $%.2f", size_usd, self.s.max_position_usd)
             return None
+        # Limit-FAK at price + slippage cap: bounds the worst fill (an unbounded
+        # market order can eat the whole edge on a thin book).
+        px = self._round_tick(min(price + self.s.clob_slippage, 1.0 - tick_size), tick_size)
+        if not (0.0 < px < 1.0):
+            return None
+        shares = round(size_usd / px, 2)
         if not self._armed:
-            log.warning("[DRY-LIVE] would BUY $%.2f of %s @~%.3f (arm with POLYBOT_LIVE_CONFIRM=%s)",
-                        size_usd, token_id[:14], price, LIVE_CONFIRM_SENTINEL)
+            log.warning("[DRY-LIVE] would BUY %.2f sh of %s @<=%.3f (arm with POLYBOT_LIVE_CONFIRM=%s)",
+                        shares, token_id[:14], px, LIVE_CONFIRM_SENTINEL)
             return None
         try:
-            from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
-            args = MarketOrderArgs(token_id=token_id, amount=round(size_usd, 2), side=Side.BUY)
+            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
+            args = OrderArgs(token_id=token_id, price=px, size=shares, side=Side.BUY)
             opts = PartialCreateOrderOptions(tick_size=str(tick_size))
-            resp = self._client.create_and_post_market_order(args, opts, OrderType.FAK)
+            resp = self._client.create_and_post_order(args, opts, OrderType.FAK)
         except Exception as e:  # noqa: BLE001
             log.error("LIVE buy failed for %s: %s", token_id[:14], e)
             return None
-        return self._fill_from_response(resp, price=price, shares=size_usd / price, size_usd=size_usd)
+        return self._fill_from_response(resp, side="BUY", price=px, shares=shares, size_usd=shares * px)
 
     async def sell(self, token_id: str | None, price: float, shares: float, tick_size: float) -> Fill | None:
         if not token_id or shares <= 0.0:
@@ -101,19 +107,48 @@ class LiveExecutor:
         except Exception as e:  # noqa: BLE001
             log.error("LIVE sell failed for %s: %s", token_id[:14], e)
             return None
-        return self._fill_from_response(resp, price=px, shares=shares, size_usd=shares * px)
+        return self._fill_from_response(resp, side="SELL", price=px, shares=shares, size_usd=shares * px)
 
-    def _fill_from_response(self, resp: Any, *, price: float, shares: float, size_usd: float) -> Fill:
-        """Best-effort fill parse; falls back to the requested price/size.
+    def _fill_from_response(
+        self, resp: Any, *, side: str, price: float, shares: float, size_usd: float
+    ) -> Fill | None:
+        """Parse the actual matched amounts out of the order response.
 
-        TODO(live): confirm the exact response field names against
-        py-clob-client-v2 and use the real matched size/price for accounting.
+        Returning the *requested* size when the FAK didn't (fully) match would
+        corrupt the ledger: buys record shares we don't own, sells mark
+        positions closed while the tokens are still in the wallet. So:
+          * explicit failure / unmatched → None (no fill recorded);
+          * matched with amounts → real matched price/size;
+          * matched but amounts unparsable → fall back to requested (logged).
+        CLOB semantics: BUY makes USDC / takes shares; SELL makes shares / takes USDC.
         """
         data = resp if isinstance(resp, dict) else getattr(resp, "__dict__", {}) or {}
-        log.info("LIVE order response: %s", str(data)[:300])
+        log.info("LIVE %s response: %s", side, str(data)[:300])
+        if data.get("success") is False:
+            return None
+        status = str(data.get("status") or "").lower()
+        if status in ("unmatched", "canceled", "cancelled", "rejected", "invalid"):
+            return None
         order_id = data.get("orderID") or data.get("order_id") or data.get("id")
-        return Fill(price=price, shares=shares, size_usd=size_usd,
-                    order_id=str(order_id) if order_id else None)
+        oid = str(order_id) if order_id else None
+
+        def _f(v: Any) -> float | None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        making, taking = _f(data.get("makingAmount")), _f(data.get("takingAmount"))
+        if making is not None and taking is not None and making > 0 and taking > 0:
+            if side == "BUY":
+                usd, sh = making, taking
+            else:
+                usd, sh = taking, making
+            return Fill(price=usd / sh, shares=sh, size_usd=usd, order_id=oid)
+
+        log.warning("LIVE %s: no matched amounts in response, assuming full fill @%.3f — verify!",
+                    side, price)
+        return Fill(price=price, shares=shares, size_usd=size_usd, order_id=oid)
 
     async def usdc_balance(self) -> float | None:
         try:
