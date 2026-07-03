@@ -123,13 +123,15 @@ class PaperEngine:
         return open_ids, remaining, group_exposure
 
     async def _effective_bankroll(self) -> float:
-        """Sizing bankroll. Paper: starting bankroll compounded by realized PnL.
-        Live: the real USDC balance (which already reflects PnL)."""
+        """Sizing bankroll: the configured bank compounded by realized PnL,
+        clamped to the real USDC balance when live — the wallet may hold more
+        than the capital allotted to the bot, and Kelly must not size off that."""
+        realized = self.store.realized_pnl_all(mode=self.executor.mode)
+        target = self.s.bankroll_usd + realized
         bal = await self.executor.usdc_balance()
         if bal is not None:
-            return max(self.s.min_stake_usd, bal)
-        realized = self.store.realized_pnl_all(mode=self.executor.mode)
-        return max(self.s.min_stake_usd, self.s.bankroll_usd + realized)
+            target = min(target, bal)
+        return max(self.s.min_stake_usd, target)
 
     def _candidate_markets(self, screened, top_candidates: int) -> list[Market]:
         """Shuffle a pool `scan_pool_factor`× wider than the per-tick slice, so
@@ -147,6 +149,11 @@ class PaperEngine:
     def _group_full(self, market: Market, group_exposure: dict[str, float]) -> bool:
         left = self.s.max_exposure_per_group_usd - group_exposure.get(market.group_key(), 0.0)
         return left < self.s.min_stake_usd
+
+    def _strategy_remaining(self, name: str) -> float:
+        """Budget left for one signal under its per-strategy cap."""
+        used = self.store.exposure_by_strategy(mode=self.executor.mode).get(name, 0.0)
+        return self.s.max_exposure_per_strategy_usd - used
 
     async def _open_position(
         self,
@@ -248,6 +255,7 @@ class PaperEngine:
         horizon = getattr(self.strategy, "horizon", "resolution")
         max_spread = self._max_spread(horizon)
         open_ids, remaining, group_exposure = self._load_state()
+        remaining = min(remaining, self._strategy_remaining(self.strategy.name))
         bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 
@@ -309,6 +317,7 @@ class PaperEngine:
         horizon = getattr(analyzer, "horizon", "resolution")
         max_spread = self._max_spread(horizon)
         open_ids, remaining, group_exposure = self._load_state()
+        remaining = min(remaining, self._strategy_remaining(analyzer.name))
         bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 
@@ -363,6 +372,7 @@ class PaperEngine:
         horizon = getattr(analyzer, "horizon", "resolution")
         max_spread = self._max_spread(horizon)
         open_ids, remaining, group_exposure = self._load_state()
+        remaining = min(remaining, self._strategy_remaining(analyzer.name))
         bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 

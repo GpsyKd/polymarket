@@ -367,10 +367,15 @@ async def _run_loop(strategy: str, top: int, interval: int | None, once: bool, m
                     unrealized = await maint.unrealized_pnl()
                     total_pnl = realized + unrealized
 
+                    # Hysteresis: trip at -limit, clear only after recovering to
+                    # half of it — otherwise PnL hovering at the threshold makes
+                    # the switch (and its notifications) flip-flop every cycle.
+                    trip_at = -settings.daily_loss_limit_usd
+                    clear_at = trip_at / 2.0
                     opened: list = []
                     if control.paused:
                         pass
-                    elif total_pnl <= -settings.daily_loss_limit_usd:
+                    elif total_pnl <= trip_at or (kill_active and total_pnl <= clear_at):
                         log.warning("KILL-SWITCH: PnL $%.2f (24h real $%.2f + open $%.2f) <= -$%.2f — no new opens",
                                     total_pnl, realized, unrealized, settings.daily_loss_limit_usd)
                         if not kill_active:

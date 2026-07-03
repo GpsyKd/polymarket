@@ -33,11 +33,14 @@ class Settings(BaseSettings):
     min_stake_usd: float = 1.0
     max_new_positions_per_tick: int = 5
     max_exposure_per_group_usd: float = 20.0  # cap correlated (same-event) exposure
+    # Per-signal budget under the total cap: stops slow value bets (llm/whale held
+    # to resolution) from locking the whole bank for weeks and starving the others.
+    max_exposure_per_strategy_usd: float = 30.0
 
     # --- Stage-0 screener thresholds ---
     screen_min_liquidity_usd: float = 1000.0
     screen_min_volume24h_usd: float = 0.0
-    screen_max_days_to_resolve: int = 120
+    screen_max_days_to_resolve: int = 30  # keep resolution near so the paper-gate fills faster
     screen_min_hours_to_resolve: float = 6.0
     screen_max_spread: float = 0.08
     screen_price_low: float = 0.05

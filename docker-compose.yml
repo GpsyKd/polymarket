@@ -8,5 +8,7 @@ services:
       - .env            # cp .env.example .env and fill in keys first
     volumes:
       - ./data:/app/data   # persists the SQLite ledger across restarts
-    # Override the strategy/interval here as needed:
-    command: ["run", "--strategy", "micro", "--interval", "900"]
+    # "all" runs every signal in one process, each on its own cadence.
+    # NOTE: an explicit --interval overrides EVERY strategy's cadence
+    # (including the slow llm one) — omit it unless you mean exactly that.
+    command: ["run", "--strategy", "all"]

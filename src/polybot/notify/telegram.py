@@ -128,6 +128,15 @@ def _format_report(rep: dict[str, Any]) -> str:
             f"resolution n={res['n']} brier={res['brier']} "
             f"vs market {res['brier_baseline_market']} (beats_market={res['beats_market']})"
         )
+    by_strategy = rep.get("by_strategy")
+    if by_strategy:
+        lines.append("by strategy:")
+        for name, m in by_strategy.items():
+            line = f"• {name}: n={m['n_closed']} pnl=${m['pnl_usd']} roi={m['roi']:+.3f}"
+            sres = m.get("resolution")
+            if sres:
+                line += f" | brier {sres['brier']} vs {sres['brier_baseline_market']}"
+            lines.append(line)
     return "\n".join(lines) if lines else "no data yet"
 
 

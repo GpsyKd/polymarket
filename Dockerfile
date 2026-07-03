@@ -13,4 +13,4 @@ ENV POLYBOT_DB_PATH=/app/data/polybot.sqlite3 \
     PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["polybot"]
-CMD ["run", "--strategy", "micro", "--interval", "900"]
+CMD ["run", "--strategy", "all"]

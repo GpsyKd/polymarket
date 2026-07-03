@@ -161,6 +161,15 @@ class Storage:
         ).fetchall()
         return {r["group_key"]: float(r["s"] or 0.0) for r in rows}
 
+    def exposure_by_strategy(self, mode: str | None = None) -> dict[str, float]:
+        clause, params = self._mode_clause(mode)
+        rows = self.conn.execute(
+            "SELECT strategy, COALESCE(SUM(size_usd), 0) AS s FROM positions "
+            f"WHERE status='open'{clause} GROUP BY strategy",
+            params,
+        ).fetchall()
+        return {r["strategy"]: float(r["s"] or 0.0) for r in rows}
+
     def close_position(
         self,
         pos_id: int,

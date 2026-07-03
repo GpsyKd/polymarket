@@ -161,6 +161,17 @@ def test_exposure_by_group(tmp_path):
     store.close()
 
 
+def test_exposure_by_strategy(tmp_path):
+    store = Storage(str(tmp_path / "st.sqlite3"))
+    for mid, strat, sz in [("1", "micro", 5.0), ("2", "micro", 3.0), ("3", "whale-flow", 4.0)]:
+        store.insert_position(Position(
+            market_id=mid, question="Q", side="YES", entry_price=0.5, model_prob=0.6,
+            edge=0.1, size_usd=sz, shares=sz * 2, ts_open=_now(), strategy=strat,
+        ))
+    assert store.exposure_by_strategy() == {"micro": 8.0, "whale-flow": 4.0}
+    store.close()
+
+
 def test_recently_analyzed(tmp_path):
     store = Storage(str(tmp_path / "a.sqlite3"))
     store.record_analysis("1", 0.6, 0.8, "grok-4.3", "2026-07-02T10:00:00+00:00")
@@ -300,3 +311,58 @@ def test_open_position_group_cap(tmp_path):
         m, 0.5, None, 0.7, 0.05, 100.0, {"neg:0xG": 3.0}, dry_run=True, strategy_name="t", rationale="r"))
     assert pos2 is None and used2 == 0.0
     store.close()
+
+
+def test_effective_bankroll_clamps(tmp_path):
+    """Kelly sizes off the allotted bank (compounded), never off a fatter wallet."""
+    import asyncio
+
+    from polybot.config import Settings
+    from polybot.paper.engine import PaperEngine
+
+    class _WalletExec:
+        mode = "live"
+
+        def __init__(self, balance):
+            self._balance = balance
+
+        async def buy(self, *a):
+            return None
+
+        async def sell(self, *a):
+            return None
+
+        async def usdc_balance(self):
+            return self._balance
+
+        async def aclose(self):
+            return None
+
+    settings = Settings(bankroll_usd=100.0, min_stake_usd=1.0)
+
+    # wallet holds more than the allotted bank → clamp to the bank
+    store = Storage(str(tmp_path / "b1.sqlite3"))
+    rich = PaperEngine(settings, store, executor=_WalletExec(500.0))
+    assert asyncio.run(rich._effective_bankroll()) == 100.0
+
+    # realized live PnL compounds the bank (still within the wallet)
+    store.insert_position(Position(market_id="1", question="Q", side="YES", entry_price=0.5,
+                                   model_prob=0.6, edge=0.1, size_usd=5.0, shares=10.0,
+                                   ts_open=_now(), mode="live"))
+    store.close_position(1, 1.0, 50.0, "Yes", _now(), "resolution")
+    assert asyncio.run(rich._effective_bankroll()) == 150.0
+    store.close()
+
+    # wallet poorer than the bank → clamp to the wallet
+    store2 = Storage(str(tmp_path / "b2.sqlite3"))
+    poor = PaperEngine(settings, store2, executor=_WalletExec(40.0))
+    assert asyncio.run(poor._effective_bankroll()) == 40.0
+
+    # paper (no balance) → bank + realized paper PnL
+    paper = PaperEngine(settings, store2)
+    store2.insert_position(Position(market_id="2", question="Q", side="YES", entry_price=0.5,
+                                    model_prob=0.6, edge=0.1, size_usd=5.0, shares=10.0,
+                                    ts_open=_now(), mode="paper"))
+    store2.close_position(1, 0.0, -10.0, "No", _now(), "resolution")
+    assert asyncio.run(paper._effective_bankroll()) == 90.0
+    store2.close()
