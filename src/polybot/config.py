@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     screen_max_spread: float = 0.08
     screen_price_low: float = 0.05
     screen_price_high: float = 0.95
+    # Drop markets whose underlying event has already started (gameStartTime in the
+    # past): live sports are the worst environment for a search-based LLM — data
+    # lags, the market re-prices faster than we can, and "found the result" is
+    # usually a hallucination on a not-yet-decided game.
+    screen_skip_started_events: bool = True
     # Candidate rotation: shuffle a pool of top_candidates * this factor each tick,
     # so scans are not glued to the same handful of mega-markets.
     scan_pool_factor: int = 3
@@ -102,6 +107,11 @@ class Settings(BaseSettings):
     llm_min_confidence: float = 0.55
     llm_analysis_ttl_hours: float = 6.0  # skip re-analyzing a market seen within this window
     llm_interval_seconds: int = 1800  # default loop interval for the LLM strategy (news is slow)
+    # Value-signal guards: a huge disagreement with a liquid market is usually our
+    # own error (stale/hallucinated info), not a mispricing. Shrink the estimate
+    # toward the price before sizing, and refuse bets that diverge by more than the cap.
+    llm_shrink_to_market: float = 0.5   # sizing prob = (1-w)*model + w*market
+    llm_max_divergence: float = 0.30    # skip LLM bets that disagree with price by more than this
 
     # --- Telegram (control + notifications) ---
     telegram_bot_token: str | None = None  # or env TELEGRAM_BOT_TOKEN

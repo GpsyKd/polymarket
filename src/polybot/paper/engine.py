@@ -170,6 +170,8 @@ class PaperEngine:
         rationale: str,
         horizon: str = "resolution",
         bankroll: float | None = None,
+        market_weight: float = 0.0,
+        max_divergence: float | None = None,
     ) -> tuple[Position | None, float]:
         s = self.s
         gkey = market.group_key()
@@ -188,6 +190,8 @@ class PaperEngine:
             min_stake=s.min_stake_usd,
             remaining_exposure=min(remaining, remaining_group),
             fee=half_spread,
+            market_weight=market_weight,
+            max_divergence=max_divergence,
         )
         if bet is None:
             return None, 0.0
@@ -356,6 +360,7 @@ class PaperEngine:
                     m, yes_price, book, signal.prob_yes, edge_floor, remaining, group_exposure,
                     dry_run, strategy_name=analyzer.name, rationale=signal.rationale,
                     horizon=horizon, bankroll=bankroll,
+                    market_weight=s.llm_shrink_to_market, max_divergence=s.llm_max_divergence,
                 )
                 if pos is None:
                     continue

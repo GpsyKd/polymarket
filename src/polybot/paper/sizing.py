@@ -37,14 +37,28 @@ def decide_bet(
     min_stake: float,
     remaining_exposure: float,
     fee: float = 0.0,
+    market_weight: float = 0.0,
+    max_divergence: float | None = None,
 ) -> Bet | None:
     """Pick the better side (YES/NO) and size it, or return None to skip.
 
     `fee` is added to the entry price to model crossing the spread (a half-spread
     on entry), so `edge` and sizing are computed against the real fill price.
+
+    `max_divergence` gates on the RAW disagreement with the market: a model that
+    differs from a liquid price by a huge margin is far more likely our own error
+    (stale/hallucinated info) than a real mispricing, so skip it entirely.
+    `market_weight` shrinks the estimate toward the price before sizing, so a
+    single over-confident read becomes a moderate bet — a durable edge barely moves.
     """
     if not (0.0 < yes_price < 1.0):
         return None
+
+    if max_divergence is not None and abs(prob_yes - yes_price) > max_divergence:
+        return None
+
+    if market_weight > 0.0:
+        prob_yes = (1.0 - market_weight) * prob_yes + market_weight * yes_price
 
     if prob_yes >= yes_price:
         side, base, prob = "YES", yes_price, prob_yes

@@ -48,6 +48,22 @@ def test_decide_bet_yes_no_and_min_edge():
     assert decide_bet(0.56, 0.5, fee=0.05, **kw) is None  # edge ~0.01 < floor after fee
 
 
+def test_decide_bet_divergence_gate_and_shrinkage():
+    kw = dict(bankroll=100, min_edge=0.05, kelly_mult=0.25,
+              max_position=15, min_stake=1, remaining_exposure=100)
+    # the Samsonova case: model 0.99 vs market 0.41 → 0.58 divergence → refuse outright
+    assert decide_bet(0.99, 0.41, max_divergence=0.30, **kw) is None
+    # within the cap but shrunk toward the market before sizing
+    # p = 0.5*0.7 + 0.5*0.5 = 0.6 → edge 0.10, size = 0.25 * (0.1/0.5) * 100 = 5.0
+    shrunk = decide_bet(0.7, 0.5, market_weight=0.5, **kw)
+    assert shrunk is not None and abs(shrunk.prob - 0.6) < 1e-9
+    assert abs(shrunk.edge - 0.10) < 1e-9 and abs(shrunk.size_usd - 5.0) < 1e-6
+    # shrinkage can pull a marginal edge below the floor → no bet
+    assert decide_bet(0.58, 0.5, market_weight=0.5, **kw) is None  # 0.54 vs 0.5 → edge 0.04
+    # defaults (no gate, no shrink) keep the original behaviour
+    assert decide_bet(0.99, 0.41, **kw) is not None
+
+
 # --------------------------------------------------------------------------- #
 # order-book analytics + microstructure strategy
 # --------------------------------------------------------------------------- #

@@ -34,12 +34,16 @@ TRIAGE_SYSTEM = (
 
 DEEP_SYSTEM = (
     "You are a careful, calibrated forecaster analyzing ONE prediction market. Use the "
-    "latest available information to estimate the probability it resolves YES. Consider "
-    "base rates, recent news, and the resolution criteria. Be honest about uncertainty: "
-    "if you have no real edge over the market's current price, set confidence low. Do "
-    "NOT just anchor to the current price. Respond ONLY with JSON: {\"prob_yes\": "
-    "<0..1>, \"confidence\": <0..1>, \"rationale\": \"<=40 words\"}. `confidence` is how "
-    "much you trust your estimate over the market price."
+    "latest available information to estimate the probability it resolves YES. `prob_yes` "
+    "is the probability of the FIRST entry in the `outcomes` list; for an 'A vs B' market "
+    "the first outcome is A, so `prob_yes` is P(A wins) — never guess what YES means. "
+    "Consider base rates, recent news, and the resolution criteria. Be honest about "
+    "uncertainty: if you have no real edge over the market's current price, set confidence "
+    "low. A large disagreement with a liquid market price is usually YOUR error (stale or "
+    "wrong info), not a mispricing — for an already-decided event the price would already "
+    "reflect it. Do NOT just anchor to the current price either. Respond ONLY with JSON: "
+    "{\"prob_yes\": <0..1>, \"confidence\": <0..1>, \"rationale\": \"<=40 words\"}. "
+    "`confidence` is how much you trust your estimate over the market price."
 )
 
 
@@ -95,6 +99,7 @@ class NewsLLMAnalyzer:
         now = datetime.now(timezone.utc)
         user = json.dumps({
             "question": market.question,
+            "outcomes": market.outcomes,  # prob_yes = P(outcomes[0]); anchors "A vs B" markets
             "resolution_criteria": (market.description or "")[:1200],
             "current_yes_price": round(yes_price, 3),
             "days_to_resolve": round(_days_to_resolve(market, now), 1),

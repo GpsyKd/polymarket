@@ -27,6 +27,18 @@ def _hours_to_resolve(market: Market, now: datetime) -> float | None:
     return (market.end_date - now).total_seconds() / 3600.0
 
 
+def _event_started(market: Market, now: datetime) -> bool:
+    """True once the underlying event's kickoff has passed. Only fires when the
+    market carries a gameStartTime (sports/scheduled events); untimed markets
+    (most non-sports) are never dropped by this filter."""
+    gst = market.game_start_time
+    if gst is None:
+        return False
+    if gst.tzinfo is None:
+        gst = gst.replace(tzinfo=timezone.utc)
+    return gst <= now
+
+
 def screen_markets(
     markets: list[Market],
     settings: Settings,
@@ -53,6 +65,9 @@ def screen_markets(
         if hours is None or hours < settings.screen_min_hours_to_resolve:
             continue
         if hours > settings.screen_max_days_to_resolve * 24:
+            continue
+
+        if settings.screen_skip_started_events and _event_started(m, now):
             continue
 
         price = m.yes_price()

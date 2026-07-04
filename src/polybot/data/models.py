@@ -60,6 +60,8 @@ class Market(BaseModel):
 
     end_date: datetime | None = Field(default=None, alias="endDate")
     start_date: datetime | None = Field(default=None, alias="startDate")
+    # Kickoff time for sports/event markets; used to skip already-underway events.
+    game_start_time: datetime | None = Field(default=None, alias="gameStartTime")
 
     active: bool = True
     closed: bool = False
@@ -86,6 +88,12 @@ class Market(BaseModel):
     @classmethod
     def _v_float(cls, v: Any) -> float | None:
         return _to_float(v)
+
+    @field_validator("end_date", "start_date", "game_start_time", mode="before")
+    @classmethod
+    def _v_dt(cls, v: Any) -> Any:
+        # Gamma sends "" for missing dates, which pydantic can't parse — treat as None.
+        return None if v == "" else v
 
     @field_validator("outcomes", "clob_token_ids", mode="before")
     @classmethod
