@@ -79,12 +79,19 @@ class GammaClient:
                     ascending=ascending,
                 )
             except httpx.HTTPStatusError as e:
-                if order is not None:
-                    log.warning("markets request failed with order=%r (%s); retrying unordered",
+                # Gamma 422s on some order params (reject at offset 0) and on any
+                # offset past its hard cap (~2000). If the order param was rejected
+                # up front, retry unordered from the top; otherwise we've hit the
+                # offset ceiling — stop and use the partial set. A few thousand
+                # markets is plenty, and a partial feed beats crashing the cycle.
+                if order is not None and offset == 0:
+                    log.warning("markets order=%r rejected (%s); retrying unordered",
                                 order, e.response.status_code)
                     order = None
                     continue
-                raise
+                log.warning("markets pagination stopped at offset %d (%s); using %d fetched",
+                            offset, e.response.status_code, len(markets))
+                break
             if not page:
                 break
             for raw in page:
