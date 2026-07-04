@@ -18,6 +18,7 @@ env/
 !.env.example
 *.key
 secrets/
+apikey.txt
 
 # Data, models, logs (runtime dirs at repo root only)
 /data/
