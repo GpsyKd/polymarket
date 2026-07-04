@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from polybot.data.models import Market
-from polybot.llm.client import _extract_json
+from polybot.llm.client import _extract_json, _responses_text
 from polybot.llm.news_signal import NewsLLMAnalyzer
 
 
@@ -29,11 +29,25 @@ class FakeClient:
         self.calls.append((model, live_search))
         return self.responses.pop(0) if self.responses else None
 
+    async def complete_json_responses(self, system, user, model, *, web_search=True, x_search=True, max_tokens=1200):
+        self.calls.append((model, True))  # live search path
+        return self.responses.pop(0) if self.responses else None
+
 
 def test_extract_json():
     assert _extract_json('noise {"a": 1} tail') == {"a": 1}
     assert _extract_json("no json here") is None
     assert _extract_json("") is None
+
+
+def test_responses_text():
+    data = {"output": [
+        {"type": "reasoning"},
+        {"type": "message", "content": [{"type": "output_text", "text": '{"prob_yes":0.4}'}]},
+    ]}
+    assert _responses_text(data) == '{"prob_yes":0.4}'
+    assert _responses_text({"output": []}) == ""
+    assert _responses_text({}) == ""
 
 
 def test_triage_selects_subset():

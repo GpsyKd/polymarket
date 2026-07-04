@@ -103,9 +103,11 @@ class NewsLLMAnalyzer:
             "price_change_24h": market.price_change_24h,
             "price_change_1h": market.price_change_1h,
         })
-        data = await self.client.complete_json(
-            DEEP_SYSTEM, user, self.deep_model, live_search=self.live_search
-        )
+        if self.live_search:
+            # Live web + X search runs through the /v1/responses tools API.
+            data = await self.client.complete_json_responses(DEEP_SYSTEM, user, self.deep_model)
+        else:
+            data = await self.client.complete_json(DEEP_SYSTEM, user, self.deep_model)
         if not data or data.get("prob_yes") is None:
             return None
         try:

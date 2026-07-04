@@ -44,6 +44,17 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _responses_text(data: dict[str, Any]) -> str:
+    """Concatenate the assistant's output_text parts from a /v1/responses reply."""
+    parts: list[str] = []
+    for item in (data.get("output") or []):
+        if isinstance(item, dict) and item.get("type") == "message":
+            for c in (item.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
+                    parts.append(str(c["text"]))
+    return "".join(parts)
+
+
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, timeout: float = 60.0) -> None:
         self._client = httpx.AsyncClient(
@@ -114,3 +125,60 @@ class LLMClient:
             return parsed if isinstance(parsed, dict) else None
         except (json.JSONDecodeError, TypeError):
             return _extract_json(content)
+
+    async def complete_json_responses(
+        self,
+        system: str,
+        user: str,
+        model: str,
+        *,
+        web_search: bool = True,
+        x_search: bool = True,
+        max_tokens: int = 1200,
+    ) -> dict[str, Any] | None:
+        """JSON completion via the /v1/responses endpoint with server-side search
+        tools (web + X). The old chat `search_parameters` (Live Search) is
+        deprecated (HTTP 410); grok has no current-events knowledge without this."""
+        tools: list[dict[str, Any]] = []
+        if web_search:
+            tools.append({"type": "web_search"})
+        if x_search:
+            tools.append({"type": "x_search"})
+        body: dict[str, Any] = {
+            "model": model,
+            "instructions": system,
+            "input": [{"role": "user", "content": user}],
+            "max_output_tokens": max_tokens,
+        }
+        if tools:
+            body["tools"] = tools
+
+        data = None
+        for attempt in range(3):
+            try:
+                r = await self._client.post("/responses", json=body)
+                if r.status_code in (429, 500, 502, 503, 529) and attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+            except httpx.HTTPStatusError as e:
+                log.warning("LLM(responses) %s HTTP %s: %s", model, e.response.status_code, e.response.text[:200])
+                return None
+            except (httpx.HTTPError, ValueError) as e:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                log.warning("LLM(responses) %s call failed: %s", model, e)
+                return None
+        if data is None:
+            return None
+        text = _responses_text(data)
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, TypeError):
+            return _extract_json(text)
