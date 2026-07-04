@@ -299,6 +299,15 @@ class PaperEngine:
         async with GammaClient(s.gamma_base_url, s.http_timeout) as gamma:
             markets = await gamma.fetch_markets(max_markets=2000)
         screened = screen_markets(markets, s)
+
+        # No capital → skip the PAID triage + deep-analysis calls entirely
+        # (checked here, before triage, not just before the deep loop).
+        open_ids, remaining, group_exposure = self._load_state()
+        remaining = min(remaining, self._strategy_remaining(analyzer.name))
+        if remaining < s.min_stake_usd:
+            log.info("llm: bank full (remaining $%.2f) — skipping triage/deep calls", remaining)
+            return []
+
         batch = min(top_candidates, s.llm_triage_batch)
         pool = [r.market for r in screened[: batch * max(1, s.scan_pool_factor)]]
 
@@ -316,8 +325,6 @@ class PaperEngine:
 
         horizon = getattr(analyzer, "horizon", "resolution")
         max_spread = self._max_spread(horizon)
-        open_ids, remaining, group_exposure = self._load_state()
-        remaining = min(remaining, self._strategy_remaining(analyzer.name))
         bankroll = await self._effective_bankroll()
         opened: list[Position] = []
 
